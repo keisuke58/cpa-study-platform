@@ -30,6 +30,7 @@ from urllib.parse import unquote
 
 import requests
 import fitz  # PyMuPDF
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -228,6 +229,77 @@ def get_subcats(sess: requests.Session, course_id: int) -> list[str]:
     # lesson 型 (基本講座) と practice 型 (トレーニング) の両方を取得
     ids = re.findall(r"open_detail\('(?:lesson|practice)',\s*(\d+)", r.text)
     return list(dict.fromkeys(ids))  # 順序保持で重複除去
+
+
+def get_smart_subcat_ids(sess: requests.Session, course_id: int) -> list[str]:
+    """コースページからスマート問題集セクションの practice subcat ID のみ取得"""
+    r = sess.get(f"{BASE_URL}/course/index/list/id/{course_id}/", timeout=30)
+    soup = BeautifulSoup(r.text, "html.parser")
+    smart_ids = []
+    for div in soup.find_all("div", class_="m-ctop-course-d-list"):
+        h2 = div.find("h2", class_="m-ctop-course-d-list__title")
+        if h2 and "スマート問題集" in h2.get_text():
+            ids = re.findall(r"open_detail\('practice',\s*(\d+)", str(div))
+            smart_ids.extend(ids)
+    return list(dict.fromkeys(smart_ids))
+
+
+def scrape_smart_practice_list(sess: requests.Session, lesson_id: str) -> list[dict]:
+    """
+    /course/practice/list/id/{lesson_id}/ から問題・解答テキストを抽出。
+    戻り値: [{"title": "問題 1 ...", "question": "...", "answer": "..."}]
+    """
+    url = f"{BASE_URL}/course/practice/list/id/{lesson_id}/"
+    try:
+        r = sess.get(url, timeout=30)
+    except Exception as e:
+        print(f"      [smart] GET失敗 {lesson_id}: {e}")
+        return []
+
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    for practice_div in soup.find_all("div", class_="practice_list"):
+        h2 = practice_div.find("h2")
+        q_title = h2.get_text(strip=True) if h2 else f"lesson_{lesson_id}"
+
+        q_div = practice_div.find("div", class_="list_question")
+        q_text = q_div.get_text(separator="\n", strip=True) if q_div else ""
+
+        # 解答・解説ブロック (class に "answer" が含まれるもの)
+        ans_div = (practice_div.find(class_=re.compile(r'\banswer\b'))
+                   or practice_div.find(class_=re.compile(r'\blist_answer\b')))
+        ans_text = ans_div.get_text(separator="\n", strip=True) if ans_div else ""
+
+        results.append({
+            "title":    q_title,
+            "question": q_text,
+            "answer":   ans_text,
+        })
+    return results
+
+
+def save_smart_question(conn: sqlite3.Connection, course_id: int, lesson_id: str,
+                        lesson_url: str, q_num: int, title: str,
+                        question: str, answer: str):
+    """スマート問題集の問1件を pdfs テーブルに保存"""
+    unique_url = f"{lesson_url}#q{q_num}"
+    if already_downloaded(conn, unique_url):
+        return False
+    text = f"{title}\n\n{question}\n\n--- 解答 ---\n{answer}"
+    cur = conn.execute(
+        "INSERT OR IGNORE INTO pdfs "
+        "(course_id, title, download_url, local_path, pdf_type, page_count, text_content, sha256) "
+        "VALUES (?,?,?,?,?,?,?,?)",
+        (course_id, title, unique_url, None, "スマート問題集", 0, text,
+         hashlib.sha256(text.encode()).hexdigest()),
+    )
+    if cur.lastrowid:
+        conn.execute(
+            "INSERT OR IGNORE INTO pdfs_fts(rowid, title, text_content) VALUES (?,?,?)",
+            (cur.lastrowid, title, text),
+        )
+    conn.commit()
+    return True
 
 
 def get_lessons_in_subcat(sess: requests.Session, subcat_id: str) -> list[dict]:
@@ -490,6 +562,35 @@ async def run(email: str, password: str, max_courses: int = 0, max_zips: int = 0
 
         if max_zips > 0 and total_zips >= max_zips:
             break
+
+        # ③ スマート問題集: practice/list HTML から問題テキストを取得
+        smart_sc_ids = get_smart_subcat_ids(sess, course_id)
+        print(f"\n  スマート問題集サブカテゴリ: {len(smart_sc_ids)} 件")
+        total_smart = 0
+
+        for sc_id in smart_sc_ids:
+            lessons = get_lessons_in_subcat(sess, sc_id)
+            practice_lessons = [l for l in lessons if l["type"] == "practice"]
+            for lsn in practice_lessons:
+                lid = lsn["lesson_id"]
+                lesson_url = f"{BASE_URL}/course/practice/list/id/{lid}/"
+                if already_downloaded(conn, lesson_url + "#q1"):
+                    continue
+                qs = scrape_smart_practice_list(sess, lid)
+                if not qs:
+                    continue
+                for i, q in enumerate(qs, 1):
+                    saved = save_smart_question(
+                        conn, course_id, lid, lesson_url, i,
+                        q["title"], q["question"], q["answer"],
+                    )
+                    if saved:
+                        total_smart += 1
+                print(f"    [smart] lesson={lid}: {len(qs)} 問 保存")
+                time.sleep(0.3)
+
+        if total_smart:
+            print(f"  スマート問題集 合計 {total_smart} 問 追加")
 
     conn.close()
 
