@@ -166,6 +166,7 @@ def process_pdf(conn, sess, course_id, title, pdf_url,
 
 FSA_BASE = "https://www.fsa.go.jp"
 FSA_CID  = 9001
+FSA_SHIKEN_PATH = "/cpaaob/kouninkaikeishi-shiken/"
 
 FSA_YEAR_PAGES = [
     (2025, "2025shiken.html"),
@@ -190,15 +191,33 @@ FSA_YEAR_PAGES = [
     (2006, "18shiken.html"),
 ]
 
+# 西暦 → 和暦プレフィックス (rX=令和, hX=平成)
+YEAR_TO_WAREKI = {
+    2025: "r7", 2024: "r6", 2023: "r5", 2022: "r4", 2021: "r3",
+    2020: "r2", 2019: "r1",
+    2018: "h30", 2017: "h29", 2016: "h28", 2015: "h27",
+    2014: "h26", 2013: "h25", 2012: "h24", 2011: "h23",
+    2010: "h22", 2009: "h21", 2008: "h20", 2007: "h19", 2006: "h18",
+}
+
 SAIYOU_FILTER = "/cpaaob/shinsakai/recruit/"  # 採用情報PDFを除外
 
 
-def _exam_type_from_link_text(text: str) -> str:
-    t = text.strip()
-    if "短答" in t:
-        return "短答式"
-    if "論文" in t:
+def _resolve_href(href: str, page_url: str) -> str:
+    """href を絶対 URL に変換"""
+    if href.startswith("http"):
+        return href
+    if href.startswith("/"):
+        return FSA_BASE + href
+    base_dir = page_url.rsplit("/", 1)[0]
+    return base_dir + "/" + href
+
+
+def _exam_type_from_url(url: str) -> str:
+    if "ronbun" in url:
         return "論文式"
+    if "tantou" in url:
+        return "短答式"
     return "その他"
 
 
@@ -206,7 +225,6 @@ def _pdf_subject_from_link_text(text: str) -> str:
     t = text.strip()
     if not t:
         return "その他"
-    # よく使われる科目名
     for subj in ["財務会計論", "管理会計論", "監査論", "企業法", "租税法",
                  "経営学", "会計学", "経済学", "民法", "統計学", "答案用紙"]:
         if subj in t:
@@ -214,75 +232,120 @@ def _pdf_subject_from_link_text(text: str) -> str:
     return t[:30]
 
 
+def _extract_subpage_pdfs(conn, sess, year, sp_url, out_base):
+    """サブページから PDF リンクを全て取得してダウンロード。保存件数を返す。"""
+    exam_type = _exam_type_from_url(sp_url)
+    sp_html = fetch_html(sess, sp_url)
+    if not sp_html:
+        return 0
+
+    saved = 0
+    pdf_hrefs = re.findall(r'href=["\']([^"\']+\.pdf)["\']', sp_html, re.IGNORECASE)
+    seen = set()
+    for href in pdf_hrefs:
+        abs_pdf = _resolve_href(href, sp_url)
+        if SAIYOU_FILTER in abs_pdf or abs_pdf in seen:
+            continue
+        seen.add(abs_pdf)
+
+        # リンクテキストを周辺 HTML から取得
+        fn_pat = re.escape(abs_pdf.split("/")[-1].split("?")[0])
+        m = re.search(
+            rf'href=["\'][^"\']*{fn_pat}["\'][^>]*>(.*?)</a>',
+            sp_html, re.DOTALL | re.IGNORECASE,
+        )
+        link_text = re.sub(r'<[^>]+>', '', m.group(1)).strip() if m else ""
+        subject = _pdf_subject_from_link_text(link_text or abs_pdf.split("/")[-1])
+        pdf_type_str = "答案用紙" if ("答案" in link_text or "touan" in abs_pdf.lower()) else "設問"
+
+        stem = abs_pdf.split("/")[-1].split("?")[0].replace(".pdf", "")
+        title = f"[{year}年 {exam_type}] {subject}"
+        fname = safe_fn(f"{year}_{exam_type}_{subject}_{stem}") + ".pdf"
+        out_path = out_base / str(year) / fname
+
+        ok = process_pdf(conn, sess, FSA_CID, title, abs_pdf, out_path, pdf_type_str)
+        if ok:
+            saved += 1
+        time.sleep(0.3)
+    return saved
+
+
 def scrape_fsa(conn: sqlite3.Connection, sess: requests.Session):
     print("\n" + "="*60)
     print("[金融庁] 公認会計士試験 過去問 (短答式・論文式)")
     print("="*60)
     ensure_course(conn, FSA_CID, "公認会計士試験 過去問 (金融庁)",
-                  FSA_BASE + "/cpaaob/kouninkaikeishi-shiken/kakoshiken.html")
+                  FSA_BASE + FSA_SHIKEN_PATH + "kakoshiken.html")
 
     total = 0
+    out_base = PDF_DIR / "金融庁_CPA過去問"
 
     for year, year_file in FSA_YEAR_PAGES:
-        year_url = FSA_BASE + "/cpaaob/kouninkaikeishi-shiken/" + year_file
+        year_url = FSA_BASE + FSA_SHIKEN_PATH + year_file
+        wareki   = YEAR_TO_WAREKI.get(year, "")
         print(f"\n  [{year}] {year_url}")
 
         html = fetch_html(sess, year_url)
-        if not html:
-            continue
 
-        # 年度ページから "mondai" を含むサブページリンクを抽出
-        subpages = []
-        for link_url, link_text in re.findall(r'href="([^"]+)"[^>]*>\s*([^<]+)', html):
-            if "mondai" in link_url and SAIYOU_FILTER not in link_url:
-                abs_url = link_url if link_url.startswith("http") else FSA_BASE + link_url
-                exam_type = _exam_type_from_link_text(link_text)
-                subpages.append((exam_type, link_text.strip(), abs_url))
+        subpage_urls: set[str] = set()
+        direct_pdfs: set[str] = set()
 
-        if not subpages:
-            print(f"    サブページ未発見")
-            continue
+        if html:
+            # href を全抽出（ネスト済みタグのリンクも正しく取得）
+            for href in re.findall(r'href=["\']([^"\']+)["\']', html, re.IGNORECASE):
+                if SAIYOU_FILTER in href:
+                    continue
+                abs_h = _resolve_href(href, year_url)
+                if FSA_SHIKEN_PATH not in abs_h:
+                    continue
+                if abs_h.lower().endswith(".pdf"):
+                    direct_pdfs.add(abs_h)
+                elif abs_h.endswith(".html"):
+                    # 問題ページ: tantou_mondai_r06a.html (親ディレクトリ) も
+                    #             ronbun_mondai_r06.html (サブディレクトリ) も "mondai" を含む
+                    page_name = abs_h.split("/")[-1].lower()
+                    if "mondai" in page_name:
+                        subpage_urls.add(abs_h)
 
-        print(f"    {len(subpages)} サブページ")
+        # フォールバック: 既知パターンで直接 URL を構築して HEAD 確認
+        # tantou_mondai は親ディレクトリ、ronbun_mondai はサブディレクトリ
+        if not subpage_urls and not direct_pdfs and wareki:
+            num = wareki.lstrip("rh")
+            num_padded = num.zfill(2)
+            base_par = FSA_BASE + FSA_SHIKEN_PATH
+            base_sub = f"{base_par}{wareki}shiken/"
+            candidates = [
+                f"{base_sub}ronbun_mondai_{wareki}{num_padded}.html",
+                f"{base_par}tantou_mondai_{wareki}{num_padded}a.html",
+                f"{base_par}tantou_mondai_{wareki}{num_padded}b.html",
+                f"{base_par}tantou_mondai_{wareki}{num_padded}.html",
+                f"{base_sub}mondai.html",
+            ]
+            for cand in candidates:
+                try:
+                    r = sess.head(cand, timeout=10, headers=HEADERS, allow_redirects=True)
+                    if r.status_code == 200:
+                        subpage_urls.add(cand)
+                except Exception:
+                    pass
 
-        for exam_type, sp_text, sp_url in subpages:
-            sp_html = fetch_html(sess, sp_url)
-            if not sp_html:
-                continue
+        print(f"    {len(subpage_urls)} サブページ, {len(direct_pdfs)} 直接PDF")
 
-            # 科目別PDF リンク抽出
-            pdf_pairs = re.findall(
-                r'href="([^"]+\.pdf)"[^>]*>\s*([^<]*)',
-                sp_html, re.IGNORECASE
-            )
-            valid_pdfs = [(u, t.strip()) for u, t in pdf_pairs
-                          if SAIYOU_FILTER not in u]
+        # 直接PDFリンク（旧年度）
+        for abs_pdf in direct_pdfs:
+            exam_type = _exam_type_from_url(abs_pdf)
+            stem = abs_pdf.split("/")[-1].replace(".pdf", "")
+            title = f"[{year}年 {exam_type}] {stem}"
+            fname = safe_fn(f"{year}_{exam_type}_{stem}") + ".pdf"
+            out_path = out_base / str(year) / fname
+            ok = process_pdf(conn, sess, FSA_CID, title, abs_pdf, out_path, "設問")
+            if ok:
+                total += 1
+            time.sleep(0.3)
 
-            for rel_url, subj_text in valid_pdfs:
-                abs_pdf = rel_url if rel_url.startswith("http") else FSA_BASE + rel_url
-                subject = _pdf_subject_from_link_text(subj_text)
-
-                # 答案用紙か問題か
-                if "答案用紙" in subj_text or "答案" in subj_text:
-                    pdf_type = "答案用紙"
-                else:
-                    pdf_type = "設問"
-
-                # タイトル: "[2024年 短答式 第II回] 財務会計論"
-                # サブページテキストから回次を抽出
-                round_match = re.search(r'第[ⅠⅡ１２Ⅰ-Ⅱ一二]回|第[IiIIii]+回', sp_text)
-                round_str = round_match.group(0) if round_match else ""
-                title = f"[{year}年 {exam_type}{' ' + round_str if round_str else ''}] {subject}"
-
-                fname = safe_fn(f"{year}_{exam_type}_{round_str}_{subject}") + ".pdf"
-                out_dir = PDF_DIR / "金融庁_CPA過去問" / str(year)
-                out_path = out_dir / fname
-
-                ok = process_pdf(conn, sess, FSA_CID, title, abs_pdf,
-                                 out_path, pdf_type)
-                if ok:
-                    total += 1
-                time.sleep(0.3)
+        # サブページ → PDF
+        for sp_url in sorted(subpage_urls):
+            total += _extract_subpage_pdfs(conn, sess, year, sp_url, out_base)
 
     print(f"\n[金融庁] 合計 {total} PDF 新規保存")
     return total

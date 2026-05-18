@@ -104,7 +104,51 @@ def build_index(force: bool = False):
     print(f"インデックス構築完了: {CHROMA_DIR}")
 
 
-def _dense_retrieve(query: str, k: int) -> list[Chunk]:
+# course_id 範囲によるソース分類
+_SOURCE_COURSE_IDS: dict[str, list[int]] = {
+    "studyin": list(range(1, 9000)),   # studying.jp コース (< 9000)
+    "fsa":     [9001],                  # 金融庁 公式過去問
+    "openstax":[9003],                  # OpenStax 英語テキスト
+    "boki":    [9011, 9012, 9013],      # 日商簿記
+}
+
+
+def _build_chroma_where(sources: list[str] | None) -> dict | None:
+    """ソースリストから ChromaDB where 句を構築する"""
+    if not sources:
+        return None
+    ids: list[int] = []
+    for s in sources:
+        ids.extend(_SOURCE_COURSE_IDS.get(s, []))
+    if not ids:
+        return None
+    # studying.jp は課題数が多いので $lt で代替
+    if any(s == "studyin" for s in sources):
+        others = [i for i in ids if i >= 9000]
+        if others:
+            return {"$or": [
+                {"course_id": {"$lt": 9000}},
+                {"course_id": {"$in": others}},
+            ]}
+        return {"course_id": {"$lt": 9000}}
+    return {"course_id": {"$in": ids}}
+
+
+def _build_sql_where(sources: list[str] | None) -> tuple[str, list]:
+    """ソースリストから SQL WHERE 句と params を返す"""
+    if not sources:
+        return "", []
+    ids: list[int] = []
+    for s in sources:
+        ids.extend(_SOURCE_COURSE_IDS.get(s, []))
+    if not ids:
+        return "", []
+    placeholders = ",".join("?" * len(ids))
+    return f"AND p.course_id IN ({placeholders})", ids
+
+
+def _dense_retrieve(query: str, k: int,
+                    sources: list[str] | None = None) -> list[Chunk]:
     """ChromaDB による dense retrieval"""
     client = _get_chroma()
     embedder = _get_embedder()
@@ -115,7 +159,12 @@ def _dense_retrieve(query: str, k: int) -> list[Chunk]:
         normalize_embeddings=True,
     ).tolist()
 
-    results = collection.query(query_embeddings=query_emb, n_results=k)
+    where = _build_chroma_where(sources)
+    results = collection.query(
+        query_embeddings=query_emb,
+        n_results=k,
+        where=where,
+    )
     chunks = []
     for doc, meta, dist in zip(
         results["documents"][0],
@@ -133,21 +182,24 @@ def _dense_retrieve(query: str, k: int) -> list[Chunk]:
     return chunks
 
 
-def _sparse_retrieve(query: str, k: int) -> list[Chunk]:
+def _sparse_retrieve(query: str, k: int,
+                     sources: list[str] | None = None) -> list[Chunk]:
     """FTS5 (BM25) による sparse retrieval"""
     conn = sqlite3.connect(DB_PATH)
+    src_clause, src_params = _build_sql_where(sources)
     rows = conn.execute(
-        """
+        f"""
         SELECT p.title, p.course_id, p.pdf_type,
                snippet(pdfs_fts, 1, '', '', '...', 20) as snip,
                rank
         FROM pdfs_fts
         JOIN pdfs p ON pdfs_fts.rowid = p.id
         WHERE pdfs_fts MATCH ?
+        {src_clause}
         ORDER BY rank
         LIMIT ?
         """,
-        (query, k),
+        (query, *src_params, k),
     ).fetchall()
     conn.close()
 
@@ -188,16 +240,20 @@ def _rrf(dense: list[Chunk], sparse: list[Chunk], k_rrf: int = 60) -> list[Chunk
     return result
 
 
-def retrieve(query: str, k: int = TOP_K) -> list[Chunk]:
-    """Hybrid (dense + sparse + RRF) で上位 k チャンクを返す"""
+def retrieve(query: str, k: int = TOP_K,
+             sources: list[str] | None = None) -> list[Chunk]:
+    """Hybrid (dense + sparse + RRF) で上位 k チャンクを返す
+
+    sources: ["studyin", "fsa", "openstax"] などでフィルター。None で全ソース。
+    """
     try:
-        dense = _dense_retrieve(query, k)
+        dense = _dense_retrieve(query, k, sources)
     except Exception as e:
         print(f"[dense retrieval error] {e}")
         dense = []
 
     try:
-        sparse = _sparse_retrieve(query, k)
+        sparse = _sparse_retrieve(query, k, sources)
     except Exception as e:
         print(f"[sparse retrieval error] {e}")
         sparse = []

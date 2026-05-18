@@ -5678,6 +5678,20 @@ elif page == "AI Q&A 🤖":
         top_k = st.slider(t("ai_top_k", _lang), 1, 10, 5, key="ai_top_k")
         show_sources = st.checkbox(t("ai_show_src", _lang), value=True, key="ai_show_src")
 
+        st.markdown("---")
+        st.markdown(f"**{'参照元' if _lang == 'ja' else 'Sources'}**")
+        src_studyin = st.checkbox("studying.jp 講座", value=True, key="src_studyin")
+        src_fsa = st.checkbox("公式過去問 (金融庁)" if _lang == "ja" else "Official Exams (FSA)", value=True, key="src_fsa")
+        if _is_uscpa_ai:
+            src_openstax = st.checkbox("OpenStax (英語)", value=True, key="src_openstax")
+        else:
+            src_openstax = False
+        _active_sources = (
+            (["studyin"] if src_studyin else [])
+            + (["fsa"] if src_fsa else [])
+            + (["openstax"] if src_openstax else [])
+        ) or None
+
     # --- インデックス構築ボタン ---
     col_build, col_info = st.columns([1, 3])
     with col_build:
@@ -5727,7 +5741,7 @@ elif page == "AI Q&A 🤖":
             with st.spinner(t("ai_thinking", _lang)):
                 try:
                     from rag_pipeline import retrieve, generate_answer
-                    chunks = retrieve(query, k=top_k)
+                    chunks = retrieve(query, k=top_k, sources=_active_sources)
                     answer = generate_answer(
                         query,
                         chunks,
