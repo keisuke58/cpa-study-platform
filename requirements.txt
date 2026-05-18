@@ -12,3 +12,4 @@ openai
 chromadb
 supabase
 psycopg2-binary
+pinecone

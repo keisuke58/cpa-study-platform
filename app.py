@@ -6015,9 +6015,21 @@ elif page == "AI Q&A 🤖":
                 st.error(f"Error: {e}")
     with col_info:
         try:
-            from rag_pipeline import CHROMA_DIR, CHUNKS_FILE
+            from rag_pipeline import CHUNKS_FILE
             n_chunks = len(CHUNKS_FILE.read_text().splitlines()) if CHUNKS_FILE.exists() else 0
-            st.info(f"{t('ai_chunks_info', _lang)}: {n_chunks} | DB: {CHROMA_DIR}")
+            try:
+                import sys as _sys2; _sys2.path.insert(0, _rag_dir)
+                from pinecone_rag import is_available as _pc_ok, index_stats as _pc_stats
+                if _pc_ok():
+                    _stats = _pc_stats()
+                    _nv = _stats.get("total_vector_count", "?")
+                    st.info(f"{t('ai_chunks_info', _lang)}: {n_chunks} chunks | Pinecone: {_nv} vectors ☁️")
+                else:
+                    from rag_pipeline import CHROMA_DIR
+                    st.info(f"{t('ai_chunks_info', _lang)}: {n_chunks} | ChromaDB: {CHROMA_DIR}")
+            except Exception:
+                from rag_pipeline import CHROMA_DIR
+                st.info(f"{t('ai_chunks_info', _lang)}: {n_chunks} | ChromaDB: {CHROMA_DIR}")
         except Exception:
             st.info(t("coming_soon", _lang))
 

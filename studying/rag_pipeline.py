@@ -70,8 +70,13 @@ def build_index(force: bool = False):
     chunks = [json.loads(line) for line in CHUNKS_FILE.read_text().splitlines() if line.strip()]
     print(f"{len(chunks)} チャンクを読み込みました")
 
-    # 既存 ID を確認してスキップ
-    existing = set(collection.get()["ids"])
+    # 既存 ID を確認してスキップ (バッチで取得して SQLite 変数上限を回避)
+    existing: set[str] = set()
+    _BATCH = 5000
+    for _start in range(0, len(chunks), _BATCH):
+        _ids_batch = [str(i) for i in range(_start, min(_start + _BATCH, len(chunks)))]
+        _res = collection.get(ids=_ids_batch, include=[])
+        existing.update(_res["ids"])
     new_chunks = [c for i, c in enumerate(chunks) if str(i) not in existing]
     if not new_chunks:
         print("すべてのチャンクがすでにインデックス済みです")
@@ -162,7 +167,15 @@ def _build_sql_where(sources: list[str] | None) -> tuple[str, list]:
 
 def _dense_retrieve(query: str, k: int,
                     sources: list[str] | None = None) -> list[Chunk]:
-    """ChromaDB による dense retrieval"""
+    """Dense retrieval: Pinecone (cloud) → ChromaDB (local) の順に試みる"""
+    try:
+        from pinecone_rag import is_available as _pc_avail, retrieve as _pc_retrieve
+        if _pc_avail():
+            return _pc_retrieve(query, k=k, sources=sources)
+    except ImportError:
+        pass
+
+    # ChromaDB fallback (ローカル)
     client = _get_chroma()
     embedder = _get_embedder()
     collection = client.get_collection(COLLECTION_NAME)
