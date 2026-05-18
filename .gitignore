@@ -5,3 +5,5 @@ studying/.env
 studying/auth_state.json
 studying/studyin.db
 studying/after_login.png
+chroma_db/
+studying/chroma_db/

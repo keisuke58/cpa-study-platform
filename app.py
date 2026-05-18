@@ -1294,7 +1294,7 @@ with gl_c3:
         st.session_state['nav'] = "Drills 🔧"
         st.rerun()
 
-_nav_items = ["Dashboard 📊", "My Syllabus 📚", "Official Checklist ✅", "Revisions 🧭", "Vocabulary 📖", "Formulas 📐", "English Prep 🌐", "Old Exams 📄", "Study Timer ⏱️", "Mock Exams 📝", "Scores 📈", "Wrong Answers 📕", "Drills 🔧", "スマート問題集 📝", "Exam Mode ⏲️", "Survival Mode ⚡", "Analytics 📊", "Roadmap 🗺️", "Big 4 Job Hunting 💼", "Company Directory 🏢", "Future 🚀", "AI Q&A 🤖"]
+_nav_items = ["Dashboard 📊", "My Syllabus 📚", "Official Checklist ✅", "Revisions 🧭", "Vocabulary 📖", "Formulas 📐", "English Prep 🌐", "Old Exams 📄", "Study Timer ⏱️", "Mock Exams 📝", "Scores 📈", "Wrong Answers 📕", "Drills 🔧", "スマート問題集 📝", "Exam Mode ⏲️", "Survival Mode ⚡", "Analytics 📊", "Roadmap 🗺️", "Big 4 Job Hunting 💼", "Company Directory 🏢", "EDINET 🧾", "Future 🚀", "AI Q&A 🤖"]
 _per_row = 3
 for _i in range(0, len(_nav_items), _per_row):
     _row = _nav_items[_i:_i+_per_row]
