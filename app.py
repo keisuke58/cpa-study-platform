@@ -5683,13 +5683,19 @@ elif page == "AI Q&A 🤖":
         src_studyin = st.checkbox("studying.jp 講座", value=True, key="src_studyin")
         src_fsa = st.checkbox("公式過去問 (金融庁)" if _lang == "ja" else "Official Exams (FSA)", value=True, key="src_fsa")
         if _is_uscpa_ai:
-            src_openstax = st.checkbox("OpenStax (英語)", value=True, key="src_openstax")
+            src_openstax = st.checkbox("OpenStax Textbooks", value=True, key="src_openstax")
+            src_irs = st.checkbox("IRS Publications (REG)", value=True, key="src_irs")
+            src_pcaob = st.checkbox("PCAOB Standards (AUD)", value=True, key="src_pcaob")
+            src_aicpa = st.checkbox("AICPA Blueprints", value=True, key="src_aicpa")
         else:
-            src_openstax = False
+            src_openstax = src_irs = src_pcaob = src_aicpa = False
         _active_sources = (
             (["studyin"] if src_studyin else [])
             + (["fsa"] if src_fsa else [])
             + (["openstax"] if src_openstax else [])
+            + (["irs"] if src_irs else [])
+            + (["pcaob"] if src_pcaob else [])
+            + (["aicpa"] if src_aicpa else [])
         ) or None
 
     # --- インデックス構築ボタン ---

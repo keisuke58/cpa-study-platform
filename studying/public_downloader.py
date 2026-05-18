@@ -472,26 +472,30 @@ OPENSTAX_CDN = "https://assets.openstax.org/oscms-prodcms/media/documents/"
 
 def _find_openstax_pdf_url(sess: requests.Session, slug: str) -> str | None:
     """OpenStax 書籍ページから PDF ダウンロード URL を取得"""
-    book_url = f"https://openstax.org/books/{slug}/pages/1-introduction"
-    html = fetch_html(sess, book_url)
-    if not html:
-        return None
+    # Method 1: books API (v2 books endpoint, not pages)
+    for api_path in [
+        f"https://openstax.org/api/v2/books/?slug={slug}",
+        f"https://openstax.org/api/v2/books/{slug}/",
+    ]:
+        api_html = fetch_html(sess, api_path)
+        if api_html:
+            for key in ["pdf_url", "print_pdf", "high_resolution_pdf_url"]:
+                m = re.search(rf'"{key}"\s*:\s*"([^"]+\.pdf[^"]*)"', api_html)
+                if m:
+                    return m.group(1)
 
-    # assets.openstax.org の .pdf URL を探す
-    m = re.search(r'https://assets\.openstax\.org/[^\s"\']+\.pdf', html)
-    if m:
-        return m.group(0)
-
-    # JSON-LD / script タグ内の pdf_url
-    m = re.search(r'"pdf_url"\s*:\s*"([^"]+)"', html)
-    if m:
-        return m.group(1)
-
-    # API エンドポイント経由
-    api_url = f"https://openstax.org/api/v2/pages/?slug={slug}&format=json"
-    api_html = fetch_html(sess, api_url)
-    if api_html:
-        m = re.search(r'"pdf_url"\s*:\s*"([^"]+)"', api_html)
+    # Method 2: book landing page (slug-only URL)
+    for book_url in [
+        f"https://openstax.org/details/books/{slug}",
+        f"https://openstax.org/books/{slug}/pages/1-introduction",
+    ]:
+        html = fetch_html(sess, book_url)
+        if not html:
+            continue
+        m = re.search(r'https://assets\.openstax\.org/[^\s"\']+\.pdf', html)
+        if m:
+            return m.group(0)
+        m = re.search(r'"(?:pdf_url|print_pdf)"\s*:\s*"([^"]+\.pdf[^"]*)"', html)
         if m:
             return m.group(1)
 
@@ -537,13 +541,230 @@ def scrape_openstax(conn: sqlite3.Connection, sess: requests.Session):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# 4. IRS Publications (USCPA REG 向け)
+# ──────────────────────────────────────────────────────────────────────────────
+
+IRS_CID  = 9021
+IRS_BASE = "https://www.irs.gov/pub/irs-pdf/"
+
+IRS_PUBS = [
+    # 個人所得税
+    ("p17",   "Publication 17 - Your Federal Income Tax"),
+    ("p590a", "Publication 590-A - Contributions to IRAs"),
+    ("p590b", "Publication 590-B - Distributions from IRAs"),
+    ("p970",  "Publication 970 - Tax Benefits for Education"),
+    ("p575",  "Publication 575 - Pension and Annuity Income"),
+    ("p560",  "Publication 560 - Retirement Plans for Small Business"),
+    # 事業・法人
+    ("p334",  "Publication 334 - Tax Guide for Small Business"),
+    ("p542",  "Publication 542 - Corporations"),
+    ("p541",  "Publication 541 - Partnerships"),
+    # 資産・投資
+    ("p544",  "Publication 544 - Sales and Dispositions of Assets"),
+    ("p550",  "Publication 550 - Investment Income and Expenses"),
+    ("p946",  "Publication 946 - How to Depreciate Property"),
+    ("p537",  "Publication 537 - Installment Sales"),
+    ("p527",  "Publication 527 - Residential Rental Property"),
+    # 雇用
+    ("p15",   "Publication 15 - Employer Tax Guide Circular E"),
+    ("p15b",  "Publication 15-B - Fringe Benefits"),
+    # 相続・贈与
+    ("p559",  "Publication 559 - Survivors Executors and Administrators"),
+    ("p950",  "Publication 950 - Introduction to Estate and Gift Taxes"),
+]
+
+
+def scrape_irs(conn: sqlite3.Connection, sess: requests.Session):
+    print("\n" + "="*60)
+    print("[IRS] Publications for USCPA REG")
+    print("="*60)
+    ensure_course(conn, IRS_CID, "IRS Publications (USCPA REG)",
+                  "https://www.irs.gov/forms-instructions")
+
+    out_dir = PDF_DIR / "IRS_Publications"
+    total = 0
+
+    for pub_code, title in IRS_PUBS:
+        url = IRS_BASE + pub_code + ".pdf"
+        print(f"\n  {title[:60]}")
+        fname = safe_fn(title) + ".pdf"
+        out_path = out_dir / fname
+        ok = process_pdf(conn, sess, IRS_CID, title, url, out_path, "テキスト")
+        if ok:
+            total += 1
+        time.sleep(0.5)
+
+    print(f"\n[IRS] 合計 {total} PDF 新規保存")
+    return total
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 5. PCAOB Auditing Standards (USCPA AUD 向け)
+# ──────────────────────────────────────────────────────────────────────────────
+
+PCAOB_CID  = 9022
+PCAOB_CDN  = "https://assets.pcaobus.org/pcaob-dev/docs/default-source/standards"
+
+# PCAOB は個別 AS PDF ではなく年度別の合本 PDF を公開している
+PCAOB_KNOWN_PDFS = [
+    # FY2025+ (最新試験対応)
+    ("PCAOB Auditing Standards (FY beginning Dec 15 2025)",
+     PCAOB_CDN + "/documents/"
+     "auditing_standards_audits_fybeginning_on_or_after_december_15_2025.pdf"
+     "?sfvrsn=9fd23814_1"),
+    # FY2024+ (2024年度試験対応)
+    ("PCAOB Auditing Standards (FY beginning Dec 15 2024)",
+     PCAOB_CDN + "/auditing/documents/"
+     "auditing_standards_audits_after_december_15_2024.pdf"
+     "?sfvrsn=6a045cf7_1"),
+    # AS 1000 採択リリース文書
+    ("PCAOB AS 1000 General Responsibilities of the Auditor (Release 2024-004)",
+     "https://assets.pcaobus.org/pcaob-dev/docs/default-source/rulemaking/docket-049/"
+     "2024-004-as1000.pdf?sfvrsn=3ba6358a_2"),
+]
+
+# assets.pcaobus.org にある公開 PDF を動的取得するページ
+PCAOB_STD_INDEX = "https://pcaobus.org/oversight/standards/auditing-standards"
+
+
+def scrape_pcaob(conn: sqlite3.Connection, sess: requests.Session):
+    print("\n" + "="*60)
+    print("[PCAOB] Auditing Standards for USCPA AUD")
+    print("="*60)
+    ensure_course(conn, PCAOB_CID, "PCAOB Auditing Standards (USCPA AUD)",
+                  PCAOB_STD_INDEX)
+
+    out_dir = PDF_DIR / "PCAOB_Standards"
+    total = 0
+    seen: set[str] = set()
+
+    # ① 既知 CDN URL (合本 PDF) をダウンロード
+    for title, url in PCAOB_KNOWN_PDFS:
+        if url in seen:
+            continue
+        seen.add(url)
+        print(f"\n  {title[:70]}")
+        fname = safe_fn(title) + ".pdf"
+        out_path = out_dir / fname
+        ok = process_pdf(conn, sess, PCAOB_CID, title, url, out_path, "テキスト")
+        if ok:
+            total += 1
+        time.sleep(1)
+
+    # ② assets.pcaobus.org の PDF リンクを standards index ページから動的取得
+    html = fetch_html(sess, PCAOB_STD_INDEX)
+    if html:
+        pdf_hrefs = re.findall(
+            r'href=["\']([^"\']*assets\.pcaobus\.org[^"\']+\.pdf[^"\']*)["\']',
+            html, re.IGNORECASE,
+        )
+        for href in pdf_hrefs:
+            if href in seen:
+                continue
+            seen.add(href)
+            stem = href.split("?")[0].split("/")[-1].replace(".pdf", "")
+            title = "PCAOB " + stem[:60]
+            fname = safe_fn(title) + ".pdf"
+            out_path = out_dir / fname
+            ok = process_pdf(conn, sess, PCAOB_CID, title, href, out_path, "テキスト")
+            if ok:
+                total += 1
+            time.sleep(0.5)
+
+    print(f"\n[PCAOB] 合計 {total} PDF 新規保存")
+    return total
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 6. AICPA Exam Blueprints (全 4 セクション)
+# ──────────────────────────────────────────────────────────────────────────────
+
+AICPA_CID  = 9023
+AICPA_BASE = "https://www.aicpa-cima.com"
+AICPA_CDN  = "https://assets.ctfassets.net"
+
+# 検証済み CDN URL (ctfassets.net)
+AICPA_KNOWN_PDFS = [
+    # CPA Exam Blueprints (全セクション合本)
+    ("CPA Exam Blueprints 2025 (FAR AUD REG BAR ISC TCP)",
+     "https://assets.ctfassets.net/rb9cdnjh59cm/"
+     "1d9ydyuIVC3QtqOXyX2qz1/3fd82939b1674a08f93a597499ec3b2a/"
+     "CPA_Exam_Blueprints_2025.pdf"),
+    ("CPA Exam Blueprints 2026 (FAR AUD REG BAR ISC TCP)",
+     "https://assets.ctfassets.net/rb9cdnjh59cm/"
+     "71s84dkfo3KEsoLlz4vv6G/f4314469ec5368b5b4dd0d0184f00a71/"
+     "CPA_Exam_Blueprints_2026.pdf"),
+    # ThisWaytoCPA 公式副読本 (AICPA 提携)
+    ("CPA Exam Candidate Booklet (ThisWaytoCPA)",
+     "https://www.thiswaytocpa.com/collectedmedia/files/cpa-exam-booklet.pdf"),
+    ("Guide to Passing the CPA Exam (ThisWaytoCPA)",
+     "https://www.thiswaytocpa.com/collectedmedia/files/guide-cpa-exam.pdf"),
+]
+
+# AICPA ダウンロードページ (動的取得用)
+AICPA_DL_PAGE = AICPA_BASE + "/resources/download/learn-what-is-tested-on-the-cpa-exam"
+
+
+def scrape_aicpa_blueprints(conn: sqlite3.Connection, sess: requests.Session):
+    print("\n" + "="*60)
+    print("[AICPA] CPA Exam Blueprints (FAR/AUD/REG/BAR)")
+    print("="*60)
+    ensure_course(conn, AICPA_CID, "AICPA CPA Exam Blueprints",
+                  AICPA_DL_PAGE)
+
+    out_dir = PDF_DIR / "AICPA_Blueprints"
+    total = 0
+    seen: set[str] = set()
+
+    # ① 既知 CDN URL から試行 (検証済み)
+    for title, url in AICPA_KNOWN_PDFS:
+        if url in seen:
+            continue
+        seen.add(url)
+        print(f"\n  {title[:70]}")
+        fname = safe_fn(title) + ".pdf"
+        out_path = out_dir / fname
+        ok = process_pdf(conn, sess, AICPA_CID, title, url, out_path, "テキスト")
+        if ok:
+            total += 1
+        time.sleep(0.5)
+
+    # ② ダウンロードページから ctfassets CDN の PDF を動的取得
+    for page_url in [AICPA_DL_PAGE, AICPA_BASE + "/resources/landing/exam-blueprints"]:
+        html = fetch_html(sess, page_url)
+        if not html:
+            continue
+        # ctfassets.net の PDF リンクを抽出
+        cdn_pdfs = re.findall(
+            r'(https://assets\.ctfassets\.net/[^\s"\']+\.pdf)',
+            html, re.IGNORECASE,
+        )
+        for url in cdn_pdfs:
+            if url in seen:
+                continue
+            seen.add(url)
+            stem = url.split("/")[-1].replace(".pdf", "")[:60]
+            title = "AICPA " + stem
+            fname = safe_fn(title) + ".pdf"
+            out_path = out_dir / fname
+            ok = process_pdf(conn, sess, AICPA_CID, title, url, out_path, "テキスト")
+            if ok:
+                total += 1
+            time.sleep(0.5)
+
+    print(f"\n[AICPA] 合計 {total} PDF 新規保存")
+    return total
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # メイン
 # ──────────────────────────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="公開データ一括ダウンローダー")
     parser.add_argument("--source", default="all",
-                        choices=["all", "fsa", "boki", "openstax"])
+                        choices=["all", "fsa", "boki", "openstax",
+                                 "irs", "pcaob", "aicpa", "uscpa"])
     args = parser.parse_args()
 
     PDF_DIR.mkdir(parents=True, exist_ok=True)
@@ -559,6 +780,13 @@ def main():
         grand += scrape_boki(conn, sess)
     if args.source in ("all", "openstax"):
         grand += scrape_openstax(conn, sess)
+    # USCPA 向けソース ("uscpa" で一括、または個別指定)
+    if args.source in ("all", "uscpa", "irs"):
+        grand += scrape_irs(conn, sess)
+    if args.source in ("all", "uscpa", "pcaob"):
+        grand += scrape_pcaob(conn, sess)
+    if args.source in ("all", "uscpa", "aicpa"):
+        grand += scrape_aicpa_blueprints(conn, sess)
 
     conn.close()
     print(f"\n{'='*60}")

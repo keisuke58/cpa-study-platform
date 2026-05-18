@@ -110,6 +110,9 @@ _SOURCE_COURSE_IDS: dict[str, list[int]] = {
     "fsa":     [9001],                  # 金融庁 公式過去問
     "openstax":[9003],                  # OpenStax 英語テキスト
     "boki":    [9011, 9012, 9013],      # 日商簿記
+    "irs":     [9021],                  # IRS Publications (REG)
+    "pcaob":   [9022],                  # PCAOB Auditing Standards (AUD)
+    "aicpa":   [9023],                  # AICPA Exam Blueprints
 }
 
 
