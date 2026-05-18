@@ -1,30 +1,36 @@
 #!/usr/bin/env python3
 """
-studying.jp 全教材スクレイパー
-- Playwright でログイン → セッションクッキーを requests に渡す
-- 全コースの練習問題 (practice) ページを走査
-- waterMark/disposition/download リンクから 設問/解答 PDF を直接ダウンロード
-- SQLite/FTS5 でテキスト検索 DB を構築
+studying.jp 全教材スクレイパー v2
+
+取得対象:
+  - 全コースのシラバス PDF / Excel
+  - 全サブカテゴリ → 全レッスン
+    - トレーニング/練習問題: waterMarkContentZip API → ZIP (設問+解答 PDF)
+    - スマート問題集: 同上
+    - 基本講座: テキスト教材があれば取得
 
 Usage:
-    python scraper.py                   # .env から認証情報を読む（全件）
+    python scraper.py                   # 全件
     python scraper.py --max-courses 1   # テスト（1コースだけ）
-    python scraper.py --max-pdfs 10     # テスト（10 PDF だけ）
+    python scraper.py --max-zips 20     # テスト（ZIP20個まで）
 """
 
 import asyncio
 import hashlib
+import io
+import json
 import os
 import re
 import sqlite3
 import sys
 import time
+import zipfile
 from pathlib import Path
 from urllib.parse import unquote
 
 import requests
 import fitz  # PyMuPDF
-from playwright.async_api import async_playwright, Page
+from playwright.async_api import async_playwright
 
 # ──────────────────────────────────────────────────────────────────────────────
 BASE_URL = "https://member.studying.jp"
@@ -32,8 +38,13 @@ REPO_DIR = Path(__file__).parent
 PDF_DIR  = REPO_DIR / "PDF"
 DB_PATH  = REPO_DIR / "studyin.db"
 
-# 公認会計士コース ID（コース一覧ページで確認済み）
 CPA_COURSE_IDS = [2098, 2109, 2110, 2099, 2106, 2107, 2252]
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
+                  " (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # DB
@@ -52,7 +63,7 @@ def init_db(conn: sqlite3.Connection):
             title        TEXT,
             download_url TEXT UNIQUE,
             local_path   TEXT,
-            pdf_type     TEXT,  -- 設問 / 解答 / その他
+            pdf_type     TEXT,  -- 設問 / 解答 / シラバス / その他
             page_count   INTEGER,
             text_content TEXT,
             sha256       TEXT,
@@ -67,23 +78,25 @@ def init_db(conn: sqlite3.Connection):
     conn.commit()
 
 
-def already_downloaded(conn, url: str) -> bool:
-    return conn.execute("SELECT 1 FROM pdfs WHERE download_url=?", (url,)).fetchone() is not None
+def already_downloaded(conn: sqlite3.Connection, url: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM pdfs WHERE download_url=?", (url,)
+    ).fetchone() is not None
 
 
-def save_pdf_record(conn, course_id, title, dl_url, local_path, pdf_type, text, page_count, sha):
-    conn.execute(
+def save_pdf_record(conn, course_id, title, dl_url, local_path, pdf_type,
+                    text, page_count, sha):
+    cur = conn.execute(
         "INSERT OR IGNORE INTO pdfs "
         "(course_id, title, download_url, local_path, pdf_type, page_count, text_content, sha256) "
         "VALUES (?,?,?,?,?,?,?,?)",
         (course_id, title, dl_url, str(local_path), pdf_type, page_count, text, sha),
     )
-    conn.execute(
-        "INSERT INTO pdfs_fts(rowid, title, text_content) "
-        "SELECT id, title, text_content FROM pdfs WHERE download_url=? AND id NOT IN "
-        "(SELECT rowid FROM pdfs_fts)",
-        (dl_url,),
-    )
+    if cur.lastrowid:
+        conn.execute(
+            "INSERT OR IGNORE INTO pdfs_fts(rowid, title, text_content) VALUES (?,?,?)",
+            (cur.lastrowid, title, text),
+        )
     conn.commit()
 
 
@@ -91,35 +104,38 @@ def save_pdf_record(conn, course_id, title, dl_url, local_path, pdf_type, text, 
 # ヘルパー
 # ──────────────────────────────────────────────────────────────────────────────
 
-def safe_filename(name: str, max_len: int = 100) -> str:
-    return re.sub(r'[\\/*?:"<>|]', '_', name)[:max_len]
+def safe_filename(name: str, max_len: int = 80) -> str:
+    return re.sub(r'[\\/*?:"<>|\n\r\t]', '_', name).strip()[:max_len]
 
 
 def extract_pdf_text(path: Path) -> tuple[int, str]:
     try:
         doc = fitz.open(str(path))
-        pages = [p.get_text() for p in doc]
+        pages = [page.get_text() for page in doc]
         return len(doc), "\n".join(pages)
     except Exception:
         return 0, ""
 
 
-def pdf_type_from_title(title: str) -> str:
-    if "設問" in title:
+def pdf_type_from_name(name: str) -> str:
+    n = name.lower()
+    if "設問" in n or "mondai" in n:
         return "設問"
-    if "解答" in title:
+    if "解答" in n or "kaito" in n:
         return "解答"
+    if "シラバス" in n or "syllabus" in n:
+        return "シラバス"
     return "その他"
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ログイン & セッション取得
+# ログイン
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def login_and_get_session(email: str, password: str) -> tuple[requests.Session, list]:
+async def login(email: str, password: str) -> requests.Session:
     """Playwright でログインし、requests.Session にクッキーを移す"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+    async with async_playwright() as pw:
+        browser = await pw.chromium.launch(headless=True)
         ctx = await browser.new_context()
         page = await ctx.new_page()
 
@@ -136,300 +152,340 @@ async def login_and_get_session(email: str, password: str) -> tuple[requests.Ses
             raise RuntimeError(f"ログイン失敗: {page.url}")
         print(f"[login] OK → {page.url}")
 
-        cookies = await ctx.cookies()
-        await browser.close()
-
-    sess = requests.Session()
-    sess.headers.update({
-        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36"
-                      " (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Referer": BASE_URL + "/",
-    })
-    for c in cookies:
-        sess.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
-
-    return sess
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# コース情報取得
-# ──────────────────────────────────────────────────────────────────────────────
-
-async def get_course_names(email: str, password: str) -> dict[int, str]:
-    """コース一覧から ID → 名前 マッピングを取得"""
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context()
-        page = await ctx.new_page()
-        await page.goto(BASE_URL + "/login", wait_until="domcontentloaded")
-        await page.fill('input[name="mail"]', email)
-        await page.fill('input[name="password"]', password)
-        await page.click('a.a_submit')
-        await page.wait_for_load_state("domcontentloaded")
+        # コース名も取得
+        await page.click('a:has-text("コース")', timeout=10000)
         await page.wait_for_timeout(2000)
-        await page.click('a:has-text("コース")', timeout=5000)
-        await page.wait_for_timeout(2000)
-
         links = await page.evaluate("""() =>
             Array.from(document.querySelectorAll('a[href*="/course/id/"]'))
                 .map(a => ({name: a.innerText.trim(), href: a.href}))
                 .filter(x => x.name.length > 1)
         """)
+
+        cookies = await ctx.cookies()
         await browser.close()
 
-    result = {}
-    for l in links:
-        m = re.search(r'/course/id/(\d+)/', l["href"])
+    sess = requests.Session()
+    sess.headers.update(HEADERS)
+    for c in cookies:
+        sess.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+
+    course_names = {}
+    for lnk in links:
+        m = re.search(r'/course/id/(\d+)/', lnk["href"])
         if m:
             cid = int(m.group(1))
-            if cid not in result and l["name"]:
-                result[cid] = l["name"]
-    return result
+            if cid not in course_names and lnk["name"]:
+                course_names[cid] = lnk["name"]
+
+    print(f"[courses] {len(course_names)} コース確認: {list(course_names.keys())}")
+    return sess, course_names
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# practice ページ URL 取得（Playwright で SPA レンダリング後に取得）
+# コース教材メタ (シラバス PDF / Excel)
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def get_practice_urls(page: Page, course_id: int) -> list[str]:
-    """コース詳細ページから全 practice URL を取得（Playwright 使用）"""
-    await page.goto(f"{BASE_URL}/course/id/{course_id}/", wait_until="domcontentloaded", timeout=30000)
-    await page.wait_for_timeout(3000)
+def download_course_meta(sess: requests.Session, course_id: int,
+                         course_name: str, conn: sqlite3.Connection):
+    out_dir = PDF_DIR / safe_filename(course_name)[:30]
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    links = await page.evaluate("""() =>
-        Array.from(document.querySelectorAll('a[href]'))
-            .map(a => a.href)
-            .filter(h => h.includes('/course/practice/') || h.includes('/course/text/'))
-    """)
-
-    seen = set()
-    result = []
-    for url in links:
-        if url not in seen:
-            seen.add(url)
-            result.append(url)
-    return result
-
-
-# ──────────────────────────────────────────────────────────────────────────────
-# practice ページから PDF ダウンロードリンクを取得
-# ──────────────────────────────────────────────────────────────────────────────
-
-def get_pdf_links_from_practice(sess: requests.Session, practice_url: str) -> list[dict]:
-    """practice ページを requests で取得して waterMark ダウンロードリンクを抽出"""
-    from html.parser import HTMLParser
-
-    class PdfLinkParser(HTMLParser):
-        def __init__(self):
-            super().__init__()
-            self.links = []
-            self._current_text = ""
-            self._in_link = False
-
-        def handle_starttag(self, tag, attrs):
-            if tag == "a":
-                for k, v in attrs:
-                    if k == "href" and v and "waterMark/disposition/download" in v:
-                        self._in_link = True
-                        url = v if v.startswith("http") else BASE_URL + "/" + v.lstrip("/")
-                        self.links.append({"url": url, "text": ""})
-            elif tag in ("span", "div") and self._in_link:
-                pass
-
-        def handle_data(self, data):
-            if self._in_link and self.links:
-                self.links[-1]["text"] += data.strip()
-
-        def handle_endtag(self, tag):
-            if tag == "a":
-                self._in_link = False
-
-    r = sess.get(practice_url, timeout=30)
-    if r.status_code != 200:
-        return []
-
-    parser = PdfLinkParser()
-    parser.feed(r.text)
-
-    # テキストが空のリンクにはファイル名から推測
-    result = []
-    seen = set()
-    for link in parser.links:
-        if link["url"] in seen:
+    for kind, ext, url in [
+        ("syllabus", "pdf", f"{BASE_URL}/course/index/download-pdf/id/{course_id}/"),
+        ("excel",    "xlsx", f"{BASE_URL}/course/index/download-excel/id/{course_id}/"),
+    ]:
+        if already_downloaded(conn, url):
             continue
-        seen.add(link["url"])
-        result.append({"url": link["url"], "title": link["text"].strip()})
-    return result
+        try:
+            r = sess.get(url, timeout=60)
+            if r.status_code != 200 or len(r.content) < 100:
+                continue
+            fname = f"{safe_filename(course_name)[:40]}_シラバス.{ext}"
+            path = out_dir / fname
+            path.write_bytes(r.content)
+            if ext == "pdf":
+                page_count, text = extract_pdf_text(path)
+                sha = hashlib.sha256(r.content).hexdigest()
+                save_pdf_record(conn, course_id, f"{course_name} シラバス",
+                                url, path, "シラバス", text, page_count, sha)
+                print(f"  [meta] シラバス PDF {page_count}p 保存")
+            else:
+                print(f"  [meta] Excel 保存: {fname}")
+        except Exception as e:
+            print(f"  [meta] {kind} 取得失敗: {e}")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# PDF ダウンロード & 保存
+# サブカテゴリ / レッスン 一覧取得
 # ──────────────────────────────────────────────────────────────────────────────
 
-def download_pdf(sess: requests.Session, url: str, out_dir: Path, title_hint: str = "") -> tuple[Path | None, str]:
-    """PDF をダウンロードして保存。(path, title) を返す"""
-    try:
-        r = sess.get(url, allow_redirects=True, timeout=60, stream=True)
-        if r.status_code != 200:
-            return None, ""
+def get_subcats(sess: requests.Session, course_id: int) -> list[str]:
+    """コース内の全サブカテゴリ ID を取得 (lesson + practice 両型)"""
+    r = sess.get(f"{BASE_URL}/course/index/list/id/{course_id}/", timeout=30)
+    # lesson 型 (基本講座) と practice 型 (トレーニング) の両方を取得
+    ids = re.findall(r"open_detail\('(?:lesson|practice)',\s*(\d+)", r.text)
+    return list(dict.fromkeys(ids))  # 順序保持で重複除去
 
-        # ファイル名を Content-Disposition から取得
-        cd = r.headers.get("content-disposition", "")
-        fname_match = re.search(r"filename\*?=(?:UTF-8'')?([^\s;]+)", cd)
-        if fname_match:
-            fname = unquote(fname_match.group(1).strip('"'))
-        elif title_hint:
-            fname = safe_filename(title_hint) + ".pdf"
+
+def get_lessons_in_subcat(sess: requests.Session, subcat_id: str) -> list[dict]:
+    """サブカテゴリ内の全レッスン情報を取得"""
+    r = sess.get(f"{BASE_URL}/course/index/lesson/id/{subcat_id}/", timeout=30)
+    html = r.text
+
+    lessons = []
+    # <a> タグを1個ずつ処理（属性順序は不定）
+    for anchor in re.findall(r'<a\b[^>]*>', html, re.DOTALL):
+        href_m  = re.search(r'href=["\']([^"\']+course/(?:lesson|practice|question)[^"\']+)["\']', anchor)
+        lid_m   = re.search(r'data-course-lesson-id=["\'](\d+)["\']', anchor)
+        if not href_m:
+            continue
+        href = href_m.group(1)
+        lesson_id = lid_m.group(1) if lid_m else None
+
+        # URL から ID 抽出
+        url_id_m = re.search(r'/id/(\d+)/', href)
+        q_id_m   = re.search(r'/q/(\d+)/', href)
+        url_id = (url_id_m or q_id_m)
+        if not url_id:
+            continue
+
+        if "/practice/" in href:
+            ltype = "practice"
+        elif "/question/" in href:
+            ltype = "question"
         else:
-            fname = "unknown.pdf"
+            ltype = "lesson"
 
-        fname = safe_filename(fname.replace(".pdf", "")) + ".pdf"
-        out_dir.mkdir(parents=True, exist_ok=True)
-        path = out_dir / fname
+        lessons.append({
+            "url":       href if href.startswith("http") else BASE_URL + href,
+            "url_id":    url_id.group(1),
+            "lesson_id": lesson_id or url_id.group(1),
+            "type":      ltype,
+        })
 
-        if path.exists():
-            return path, path.stem
+    # data-course-lesson-id が <a> タグ外にある場合の補足
+    # <li data-course-lesson-id="..."><a href="...">
+    for li in re.findall(r'<li\b[^>]*data-course-lesson-id=["\'](\d+)["\'][^>]*>.*?</li>',
+                         html, re.DOTALL):
+        lid = re.search(r'data-course-lesson-id=["\'](\d+)["\']', li)
+        href_m = re.search(r'href=["\']([^"\']+course/(?:lesson|practice|question)[^"\']+)["\']', li)
+        if not lid or not href_m:
+            continue
+        href = href_m.group(1)
+        url_id_m = re.search(r'/id/(\d+)/', href)
+        q_id_m   = re.search(r'/q/(\d+)/', href)
+        url_id = (url_id_m or q_id_m)
+        if not url_id:
+            continue
+        # 既存エントリの lesson_id を上書き更新
+        for entry in lessons:
+            if entry["url_id"] == url_id.group(1):
+                entry["lesson_id"] = lid.group(1)
+                break
 
-        content = r.content
-        if b"%PDF" not in content[:20]:
-            return None, ""
+    return lessons
 
-        path.write_bytes(content)
-        return path, path.stem
+
+# ──────────────────────────────────────────────────────────────────────────────
+# タイトル解決（レッスンページから）
+# ──────────────────────────────────────────────────────────────────────────────
+
+def get_lesson_title(sess: requests.Session, lesson_url: str) -> str:
+    """レッスンページの <title> または h1 から表示名を取得"""
+    try:
+        r = sess.get(lesson_url, timeout=20)
+        m = re.search(r'<title[^>]*>([^<]+)</title>', r.text)
+        if m:
+            t = m.group(1).strip()
+            # "ページ名 | サイト名" の形式から前半を取る
+            return t.split("|")[0].split("｜")[0].strip()
+    except Exception:
+        pass
+    return ""
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ZIP ダウンロード (waterMarkContentZip API)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def download_lesson_zip(sess: requests.Session, lesson_id: str,
+                        out_dir: Path, conn: sqlite3.Connection,
+                        course_id: int, title_hint: str = "") -> int:
+    """
+    waterMarkContentZip API → ZIP DL → 各 PDF を抽出・保存・DB登録。
+    返値: 新規保存した PDF 数
+    """
+    api_url = f"{BASE_URL}/api/practice/waterMarkContentZip/id/{lesson_id}/"
+
+    if already_downloaded(conn, api_url):
+        return 0
+
+    try:
+        r = sess.get(api_url, timeout=30)
+        if r.status_code != 200:
+            return 0
+        data = r.json()
+        if data.get("status") != "200" or not data.get("downLoadUrl"):
+            return 0
+
+        zip_url  = data["downLoadUrl"]
+        zip_name = data.get("fileName", f"lesson_{lesson_id}.zip")
+        title_base = safe_filename(zip_name.replace(".zip", ""))
+
+        # ZIP ダウンロード（pre-signed URL なのでクッキー不要）
+        rz = requests.get(zip_url, timeout=120, stream=True, headers=HEADERS)
+        if rz.status_code != 200:
+            return 0
+        zip_bytes = rz.content
 
     except Exception as e:
-        print(f"    DL error {url}: {e}")
-        return None, ""
+        print(f"      ZIP 取得失敗 [{lesson_id}]: {e}")
+        return 0
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    saved = 0
+
+    try:
+        with zipfile.ZipFile(io.BytesIO(zip_bytes)) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith(".pdf"):
+                    continue
+
+                pdf_bytes = zf.read(name)
+                if b"%PDF" not in pdf_bytes[:20]:
+                    continue
+
+                # ファイル名を UTF-8 デコード（CP437 / UTF-8 混在対策）
+                try:
+                    fname = name.encode("cp437").decode("utf-8")
+                except Exception:
+                    fname = name
+                fname = Path(fname).name
+
+                pdf_path = out_dir / safe_filename(fname)
+                if not pdf_path.suffix:
+                    pdf_path = pdf_path.with_suffix(".pdf")
+
+                # 重複チェックは sha で
+                sha = hashlib.sha256(pdf_bytes).hexdigest()
+                dup = conn.execute(
+                    "SELECT 1 FROM pdfs WHERE sha256=?", (sha,)
+                ).fetchone()
+                if dup:
+                    continue
+
+                pdf_path.write_bytes(pdf_bytes)
+                page_count, text = extract_pdf_text(pdf_path)
+                pdf_type = pdf_type_from_name(fname)
+                title = safe_filename(fname.replace(".pdf", ""))[:120]
+
+                # download_url としてはAPIのURLを使い、ファイル名+ハッシュで uniquify
+                dl_url = f"{api_url}#{sha[:8]}"
+                save_pdf_record(conn, course_id, title, dl_url,
+                                pdf_path, pdf_type, text, page_count, sha)
+                print(f"      ✓ [{pdf_type}] {title[:60]}  ({page_count}p)")
+                saved += 1
+
+        # ZIP 全体をスキップ済みとしてマーク（再ダウンロード防止）
+        if saved > 0 or True:  # always mark attempted
+            conn.execute(
+                "INSERT OR IGNORE INTO pdfs "
+                "(course_id, title, download_url, pdf_type, scraped_at) "
+                "VALUES (?,?,?,'_zip_marker',datetime('now'))",
+                (course_id, title_base, api_url),
+            )
+            conn.commit()
+
+    except zipfile.BadZipFile as e:
+        print(f"      ZIP 破損 [{lesson_id}]: {e}")
+
+    return saved
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # メイン
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def run(email: str, password: str, max_courses: int = 0, max_pdfs: int = 0):
+async def run(email: str, password: str, max_courses: int = 0, max_zips: int = 0):
     PDF_DIR.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context()
-        nav_page = await ctx.new_page()
+    sess, course_names = await login(email, password)
 
-        # ① ログイン（Playwright）
-        print("[login] ログイン中...")
-        await nav_page.goto(BASE_URL + "/login", wait_until="domcontentloaded", timeout=60000)
-        await nav_page.wait_for_timeout(1000)
-        await nav_page.fill('input[name="mail"]', email)
-        await nav_page.fill('input[name="password"]', password)
-        await nav_page.click('a.a_submit, button[type="submit"]')
-        await nav_page.wait_for_load_state("domcontentloaded", timeout=60000)
-        await nav_page.wait_for_timeout(2000)
-        if "/login" in nav_page.url:
-            raise RuntimeError(f"ログイン失敗: {nav_page.url}")
-        print(f"[login] OK → {nav_page.url}")
+    target_ids = CPA_COURSE_IDS[:max_courses] if max_courses > 0 else CPA_COURSE_IDS
 
-        # ② セッションクッキーを requests に転送
-        cookies = await ctx.cookies()
-        sess = requests.Session()
-        sess.headers.update({"User-Agent": "Mozilla/5.0 Chrome/120.0.0.0"})
-        for c in cookies:
-            sess.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+    total_zips = 0
+    total_pdfs = 0
 
-        # ③ コース名取得
-        print("[courses] コース名を取得中...")
-        await nav_page.click('a:has-text("コース")', timeout=5000)
-        await nav_page.wait_for_timeout(2000)
-        links = await nav_page.evaluate("""() =>
-            Array.from(document.querySelectorAll('a[href*="/course/id/"]'))
-                .map(a => ({name: a.innerText.trim(), href: a.href}))
-                .filter(x => x.name.length > 1)
-        """)
-        course_names = {}
-        for l in links:
-            m = re.search(r'/course/id/(\d+)/', l["href"])
-            if m:
-                cid = int(m.group(1))
-                if cid not in course_names and l["name"]:
-                    course_names[cid] = l["name"]
-        print(f"  {len(course_names)} コース確認")
+    for course_id in target_ids:
+        name = course_names.get(course_id, f"course_{course_id}")
+        print(f"\n{'='*60}")
+        print(f"[course {course_id}] {name}")
+        print(f"{'='*60}")
 
-        target_ids = CPA_COURSE_IDS
-        if max_courses > 0:
-            target_ids = target_ids[:max_courses]
+        conn.execute(
+            "INSERT OR IGNORE INTO courses (id, name, url) VALUES (?,?,?)",
+            (course_id, name, f"{BASE_URL}/course/id/{course_id}/"),
+        )
+        conn.commit()
 
-        total_pdfs = 0
+        # ① シラバス PDF + Excel
+        download_course_meta(sess, course_id, name, conn)
 
-        # ④ コースごとに処理
-        for course_id in target_ids:
-            name = course_names.get(course_id, f"course_{course_id}")
-            print(f"\n[course {course_id}] {name}")
+        out_dir_base = PDF_DIR / safe_filename(name)[:30]
 
-            conn.execute(
-                "INSERT OR IGNORE INTO courses (id, name, url) VALUES (?,?,?)",
-                (course_id, name, f"{BASE_URL}/course/id/{course_id}/"),
-            )
-            conn.commit()
+        # ② サブカテゴリ一覧
+        subcats = get_subcats(sess, course_id)
+        print(f"  サブカテゴリ: {len(subcats)} 件")
 
-            # ⑤ practice URL 収集（Playwright）
-            practice_urls = await get_practice_urls(nav_page, course_id)
-            print(f"  practice ページ: {len(practice_urls)}")
+        for sc_idx, subcat_id in enumerate(subcats, 1):
+            print(f"\n  [{sc_idx}/{len(subcats)}] subcat={subcat_id}")
+            lessons = get_lessons_in_subcat(sess, subcat_id)
+            practice_lessons = [l for l in lessons if l["type"] in ("practice", "question")]
+            print(f"    レッスン合計: {len(lessons)}  (practice/question: {len(practice_lessons)})")
 
-            out_dir = PDF_DIR / safe_filename(name)[:30]
+            for lsn in practice_lessons:
+                print(f"    → lesson_id={lsn['lesson_id']}  type={lsn['type']}")
 
-            # ⑥ 各 practice ページの PDF をダウンロード
-            for p_idx, p_url in enumerate(practice_urls, 1):
-                print(f"  [{p_idx}/{len(practice_urls)}] {p_url}")
+                n = download_lesson_zip(
+                    sess, lsn["lesson_id"],
+                    out_dir_base, conn, course_id,
+                )
+                total_pdfs += n
+                if n > 0:
+                    total_zips += 1
 
-                pdf_links = get_pdf_links_from_practice(sess, p_url)
-                if not pdf_links:
-                    print(f"    PDF リンクなし（requests で取得できず）")
-                    continue
+                time.sleep(0.5)  # サーバー負荷軽減
 
-                for link in pdf_links:
-                    if already_downloaded(conn, link["url"]):
-                        print(f"    skip (済): {link['title'][:40]}")
-                        continue
-
-                    pdf_path, title = download_pdf(sess, link["url"], out_dir, link["title"])
-                    if not pdf_path:
-                        continue
-
-                    page_count, text = extract_pdf_text(pdf_path)
-                    sha = hashlib.sha256(pdf_path.read_bytes()).hexdigest()
-                    pdf_t = pdf_type_from_title(title)
-
-                    save_pdf_record(conn, course_id, title, link["url"],
-                                    pdf_path, pdf_t, text, page_count, sha)
-                    print(f"    ✓ [{pdf_t}] {title[:50]}  ({page_count}p)")
-                    total_pdfs += 1
-
-                    if max_pdfs > 0 and total_pdfs >= max_pdfs:
-                        print(f"\n[info] --max-pdfs {max_pdfs} 到達。終了。")
-                        break
-                    time.sleep(0.3)
-
-                if max_pdfs > 0 and total_pdfs >= max_pdfs:
+                if max_zips > 0 and total_zips >= max_zips:
+                    print(f"\n[info] --max-zips {max_zips} 到達。終了。")
                     break
 
-            if max_pdfs > 0 and total_pdfs >= max_pdfs:
+            if max_zips > 0 and total_zips >= max_zips:
                 break
 
-        await browser.close()
+        if max_zips > 0 and total_zips >= max_zips:
+            break
 
     conn.close()
 
     # 統計
     conn2 = sqlite3.connect(DB_PATH)
-    n_pdfs    = conn2.execute("SELECT COUNT(*) FROM pdfs").fetchone()[0]
+    n_pdfs    = conn2.execute("SELECT COUNT(*) FROM pdfs WHERE pdf_type != '_zip_marker'").fetchone()[0]
     n_courses = conn2.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
+    by_type   = conn2.execute(
+        "SELECT pdf_type, COUNT(*) FROM pdfs WHERE pdf_type != '_zip_marker' GROUP BY pdf_type"
+    ).fetchall()
     conn2.close()
 
-    print(f"\n{'='*50}")
+    print(f"\n{'='*60}")
     print(f"完了: {n_courses} コース / {n_pdfs} PDF")
+    for t, c in by_type:
+        print(f"  {t or 'その他': <12} {c} 件")
     print(f"DB:   {DB_PATH}")
     print(f"PDF:  {PDF_DIR}/")
-    print(f"\n検索: python search.py '貸倒引当金'")
+    print(f"\n検索: python search.py '棚卸資産'")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -445,15 +501,15 @@ if __name__ == "__main__":
                 k, _, v = line.partition("=")
                 os.environ.setdefault(k.strip(), v.strip())
 
-    parser = argparse.ArgumentParser(description="studying.jp 全教材スクレイパー")
+    parser = argparse.ArgumentParser(description="studying.jp 全教材スクレイパー v2")
     parser.add_argument("--email",       default=os.environ.get("STUDYIN_EMAIL"))
     parser.add_argument("--password",    default=os.environ.get("STUDYIN_PASSWORD"))
     parser.add_argument("--max-courses", type=int, default=0, help="テスト: コース数上限")
-    parser.add_argument("--max-pdfs",    type=int, default=0, help="テスト: PDF数上限")
+    parser.add_argument("--max-zips",    type=int, default=0, help="テスト: ZIP数上限")
     args = parser.parse_args()
 
     if not args.email or not args.password:
         print("[error] studying/.env に認証情報を設定してください。")
         sys.exit(1)
 
-    asyncio.run(run(args.email, args.password, args.max_courses, args.max_pdfs))
+    asyncio.run(run(args.email, args.password, args.max_courses, args.max_zips))
