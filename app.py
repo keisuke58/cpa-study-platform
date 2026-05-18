@@ -3442,44 +3442,153 @@ elif page == "Survival Mode ⚡":
                     st.rerun()
 
 elif page == "Analytics 📊":
-    st.header("Analytics")
+    st.header("Analytics 📊")
+
     scores_df = pd.DataFrame(st.session_state.data.get("scores", []))
-    logs_df = pd.DataFrame(st.session_state.data.get("logs", []))
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Skill Radar")
-        subjects = ['Financial', 'Management', 'Audit', 'Company', 'Tax', 'Elective']
-        radar_scores = [30] * 6
-        if not scores_df.empty:
-            vals = []
-            for sub in subjects:
-                sub_df = scores_df[scores_df['subject'] == sub]
-                if not sub_df.empty:
-                    vals.append(sub_df['val'].mean())
+    logs_df   = pd.DataFrame(st.session_state.data.get("logs", []))
+    wa_df     = pd.DataFrame(st.session_state.data.get("wrong_answers", []))
+
+    _SUBJ_ORDER  = ["Financial", "Management", "Audit", "Company"]
+    _SUBJ_LABELS = {s: subject_label(s, _lang) for s in _SUBJ_ORDER}
+
+    tab_radar, tab_heat, tab_ai = st.tabs(["🕸️ Skill Radar", "🗺️ Weakness Map", "🤖 AI Study Plan"])
+
+    # ── Skill Radar ───────────────────────────────────────────────────────
+    with tab_radar:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Skill Radar")
+            radar_scores = []
+            for sub in _SUBJ_ORDER:
+                if not scores_df.empty and 'subject' in scores_df.columns:
+                    sub_vals = scores_df[scores_df['subject'] == sub]['val']
+                    radar_scores.append(round(float(sub_vals.mean()), 1) if not sub_vals.empty else 30)
                 else:
-                    vals.append(30)
-            radar_scores = vals
-        fig = go.Figure(data=go.Scatterpolar(r=radar_scores, theta=subjects, fill='toself', name='Avg'))
-        fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])), showlegend=False, height=350)
-        st.plotly_chart(fig, use_container_width=True)
-    with c2:
-        st.subheader("Pacing Histogram")
-        if not logs_df.empty:
-            logs_df['date'] = pd.to_datetime(logs_df['date'])
-            logs_df['minutes'] = logs_df['duration']
-            st.plotly_chart(px.histogram(logs_df, x='minutes', nbins=20, title="Study Session Lengths"), use_container_width=True)
+                    radar_scores.append(30)
+            theta_labels = [_SUBJ_LABELS[s] for s in _SUBJ_ORDER]
+            fig_r = go.Figure(go.Scatterpolar(
+                r=radar_scores + [radar_scores[0]],
+                theta=theta_labels + [theta_labels[0]],
+                fill='toself', name='Avg Score', line_color='#4C78A8',
+            ))
+            fig_r.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                                showlegend=False, height=350)
+            st.plotly_chart(fig_r, use_container_width=True)
+            if not scores_df.empty and 'subject' in scores_df.columns:
+                summary = scores_df.groupby('subject')['val'].agg(['mean','count']).reset_index()
+                summary.columns = ['Subject', 'Avg %', 'Sessions']
+                summary['Subject'] = summary['Subject'].map(lambda s: _SUBJ_LABELS.get(s, s))
+                summary['Avg %'] = summary['Avg %'].round(1)
+                st.dataframe(summary, use_container_width=True, hide_index=True)
+        with c2:
+            st.subheader("Study Time")
+            if not logs_df.empty:
+                logs_df['date_dt'] = pd.to_datetime(logs_df['date'])
+                daily = logs_df.groupby(logs_df['date_dt'].dt.date)['duration'].sum().reset_index()
+                daily.columns = ['Date', 'Minutes']
+                st.plotly_chart(px.bar(daily, x='Date', y='Minutes', title="Daily Study (min)", height=280),
+                                use_container_width=True)
+            else:
+                st.info("No study logs yet.")
+            if not scores_df.empty and 'date' in scores_df.columns:
+                scores_df['date_dt'] = pd.to_datetime(scores_df['date'])
+                fig_t = px.line(scores_df.sort_values('date_dt'), x='date_dt', y='val', color='subject',
+                                title="Score Trend", height=260,
+                                labels={'date_dt': 'Date', 'val': 'Score %', 'subject': 'Subject'})
+                st.plotly_chart(fig_t, use_container_width=True)
+
+    # ── Weakness Map ──────────────────────────────────────────────────────
+    with tab_heat:
+        st.subheader("Subject × Level Accuracy Heatmap")
+        if wa_df.empty and scores_df.empty:
+            st.info("No quiz data yet. Complete some drills to see your weakness map.")
         else:
-            st.info("No study logs")
-    st.subheader("Weekly Heatmap")
-    if not logs_df.empty:
-        logs_df['date'] = pd.to_datetime(logs_df['date']).dt.date
-        df = logs_df.groupby('date')['duration'].sum().reset_index()
-        df['dow'] = pd.to_datetime(df['date']).dt.dayofweek
-        df['week'] = pd.to_datetime(df['date']).dt.isocalendar().week
-        pivot = df.pivot_table(index='dow', columns='week', values='duration', fill_value=0)
-        st.dataframe(pivot)
-    else:
-        st.info("No data for heatmap")
+            if not scores_df.empty and 'subject' in scores_df.columns:
+                import re as _re2
+                def _extract_level(name):
+                    m = _re2.search(r'Lv(\d)', str(name))
+                    return int(m.group(1)) if m else 0
+                scores_df['level_n'] = scores_df['name'].apply(_extract_level)
+                matrix_src = scores_df[scores_df['level_n'].isin([1, 2, 3])]
+                if not matrix_src.empty:
+                    pivot = matrix_src.pivot_table(
+                        index='level_n', columns='subject', values='val', aggfunc='mean'
+                    ).reindex(columns=_SUBJ_ORDER, fill_value=None)
+                    pivot.index = ['Level 1', 'Level 2', 'Level 3']
+                    pivot.columns = [_SUBJ_LABELS[s] for s in pivot.columns]
+                    fig_h = px.imshow(pivot, text_auto='.0f', color_continuous_scale='RdYlGn',
+                                      zmin=0, zmax=100, aspect='auto',
+                                      title="Accuracy % (Subject × Level)")
+                    fig_h.update_layout(height=280)
+                    st.plotly_chart(fig_h, use_container_width=True)
+            if not wa_df.empty:
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    wa_subj = wa_df.groupby('subject').size().reset_index(name='count')
+                    wa_subj['subject'] = wa_subj['subject'].map(lambda s: _SUBJ_LABELS.get(s, s))
+                    st.plotly_chart(px.bar(wa_subj, x='subject', y='count', color='count',
+                                           color_continuous_scale='Reds',
+                                           title="Wrong Answers by Subject", height=280),
+                                    use_container_width=True)
+                with col_b:
+                    if 'level' in wa_df.columns:
+                        wa_lv = wa_df[wa_df['level'].notna()].groupby('level').size().reset_index(name='count')
+                        wa_lv['level'] = wa_lv['level'].apply(lambda x: f"Level {int(x)}")
+                        st.plotly_chart(px.pie(wa_lv, names='level', values='count',
+                                               title="Wrong by Difficulty", height=280),
+                                        use_container_width=True)
+                st.subheader("🎯 Top Weak Areas")
+                wa_topics = wa_df.groupby(['subject', 'level']).size().reset_index(name='count')\
+                    .sort_values('count', ascending=False).head(10)
+                wa_topics['subject'] = wa_topics['subject'].map(lambda s: _SUBJ_LABELS.get(s, s))
+                wa_topics['level'] = wa_topics['level'].apply(lambda x: f"Lv{int(x)}" if pd.notna(x) else "?")
+                st.dataframe(wa_topics.rename(columns={'count': 'Wrong Count'}),
+                             use_container_width=True, hide_index=True)
+
+    # ── AI Study Plan ─────────────────────────────────────────────────────
+    with tab_ai:
+        st.subheader("🤖 AI Study Suggestion")
+        st.caption("Analyzes your weak areas and generates a personalized study plan using RAG.")
+        _weak_targets = []
+        if not wa_df.empty and 'subject' in wa_df.columns:
+            _wg = wa_df.groupby(['subject', 'level']).size().reset_index(name='cnt').sort_values('cnt', ascending=False)
+            for _, row in _wg.head(3).iterrows():
+                lv = int(row['level']) if pd.notna(row.get('level')) else '?'
+                _weak_targets.append(f"{_SUBJ_LABELS.get(row['subject'], row['subject'])} Level {lv}")
+        elif not scores_df.empty and 'subject' in scores_df.columns:
+            _low = scores_df.groupby('subject')['val'].mean().sort_values().head(3)
+            _weak_targets = [_SUBJ_LABELS.get(s, s) for s in _low.index]
+        if _weak_targets:
+            st.info(f"**Detected weak areas**: {', '.join(_weak_targets)}")
+            _ai_q = f"次の弱点科目について重点学習すべきポイントと解き方のコツを教えてください: {', '.join(_weak_targets)}"
+            import sys as _sys2
+            _rdir2 = str(Path(__file__).parent / "studying")
+            if _rdir2 not in _sys2.path:
+                _sys2.path.insert(0, _rdir2)
+            _prov = st.selectbox("Provider", ["claude", "gemini", "openai"],
+                                 format_func=lambda x: {"claude":"Claude","gemini":"Gemini","openai":"OpenAI"}[x],
+                                 key="ana_provider")
+            _ekeys = {"claude": "ANTHROPIC_API_KEY", "gemini": "GOOGLE_API_KEY", "openai": "OPENAI_API_KEY"}
+            _akey = st.text_input(_ekeys[_prov], value=os.environ.get(_ekeys[_prov], ""),
+                                  type="password", key="ana_api_key")
+            if st.button("📚 Generate Study Plan"):
+                with st.spinner("Generating..."):
+                    try:
+                        from rag_pipeline import retrieve, generate_answer
+                        _ch = retrieve(_ai_q, k=5)
+                        _plan = generate_answer(_ai_q, _ch, provider=_prov, api_key=_akey or None)
+                        st.session_state["ai_study_plan"] = _plan
+                    except Exception as _e:
+                        st.error(f"Error: {_e}")
+            if st.session_state.get("ai_study_plan"):
+                st.markdown("### 📋 Today's Study Plan")
+                st.markdown(st.session_state["ai_study_plan"])
+                if st.button("🗑️ Clear"):
+                    st.session_state.pop("ai_study_plan", None)
+                    st.rerun()
+        else:
+            st.info("Complete some drills first to generate a personalized study plan.")
+
 elif page == "Roadmap 🗺️":
     st.header("🗺️ CPA Exam Strategy Roadmap (2026-2027)")
     
