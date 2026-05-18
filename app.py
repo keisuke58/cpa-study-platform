@@ -1370,7 +1370,7 @@ if page == "Dashboard 📊":
         except Exception:
             pass
 
-    # スマート問題集の進捗を取得
+    # スマート問題集の進捗を取得（SQLite → Supabase フォールバック）
     _smart_total, _smart_done = 0, 0
     try:
         import sqlite3 as _sq
@@ -1379,6 +1379,13 @@ if page == "Dashboard 📊":
             _sc = _sq.connect(str(_sdb))
             _smart_total = _sc.execute("SELECT COUNT(*) FROM pdfs WHERE pdf_type='スマート問題集'").fetchone()[0]
             _sc.close()
+        else:
+            import sys as _sys_d
+            _rd = str(Path(__file__).parent / "studying")
+            if _rd not in _sys_d.path:
+                _sys_d.path.insert(0, _rd)
+            from supabase_client import fetch_pdf_count as _sbc
+            _smart_total = _sbc().get("スマート問題集", 0)
     except Exception:
         pass
     _smart_wrong = len([w for w in st.session_state.data.get("wrong_answers", [])
@@ -5697,43 +5704,61 @@ elif page == "スマート問題集 📝":
     st.header("スマート問題集 📝")
     st.caption("studying.jp からスクレイピングした問題集。問題を解いて答えを確認しよう。")
 
-    # ── DB から問題読み込み ─────────────────────────────────────────
+    # ── DB から問題読み込み（SQLite → Supabase フォールバック）──────
+    _COURSE_SUBJECT = {
+        2098: "管理会計論", 2099: "監査論", 2106: "企業法",
+        2107: "財務会計論", 2109: "財務会計論", 2110: "管理会計論", 2252: "財務会計論",
+    }
+
+    def _parse_rows(rows_iter):
+        result = []
+        for pid, cid, title, text in rows_iter:
+            parts = (text or "").split("--- 解答 ---")
+            q_block = parts[0].strip()
+            a_block = parts[1].strip() if len(parts) > 1 else ""
+            q_lines = q_block.split("\n\n", 1)
+            q_text = q_lines[1].strip() if len(q_lines) > 1 else q_block
+            result.append({
+                "id": pid, "course_id": cid,
+                "subject": _COURSE_SUBJECT.get(cid, "その他"),
+                "title": title,
+                "question": q_text,
+                "answer": a_block,
+            })
+        return result
+
     @st.cache_data(show_spinner=False, ttl=300)
     def _load_smart_questions():
+        # 1) ローカル SQLite
         try:
             import sqlite3 as _sq
             _sdb = Path(__file__).parent / "studying" / "studyin.db"
-            if not _sdb.exists():
-                return []
-            _c = _sq.connect(str(_sdb))
-            rows = _c.execute(
-                "SELECT id, course_id, title, text_content FROM pdfs "
-                "WHERE pdf_type='スマート問題集' ORDER BY course_id, id"
-            ).fetchall()
-            _c.close()
-            result = []
-            _COURSE_SUBJECT = {
-                2098: "管理会計論", 2099: "監査論", 2106: "企業法",
-                2107: "財務会計論", 2109: "財務会計論", 2110: "管理会計論", 2252: "財務会計論",
-            }
-            for pid, cid, title, text in rows:
-                parts = (text or "").split("--- 解答 ---")
-                q_block = parts[0].strip()
-                a_block = parts[1].strip() if len(parts) > 1 else ""
-                # q_block: "タイトル\n\n問題文"
-                q_lines = q_block.split("\n\n", 1)
-                q_text = q_lines[1].strip() if len(q_lines) > 1 else q_block
-                result.append({
-                    "id": pid, "course_id": cid,
-                    "subject": _COURSE_SUBJECT.get(cid, "その他"),
-                    "title": title,
-                    "question": q_text,
-                    "answer": a_block,
-                })
-            return result
-        except Exception as e:
-            st.error(f"DB読み込みエラー: {e}")
-            return []
+            if _sdb.exists():
+                _c = _sq.connect(str(_sdb))
+                rows = _c.execute(
+                    "SELECT id, course_id, title, text_content FROM pdfs "
+                    "WHERE pdf_type='スマート問題集' ORDER BY course_id, id"
+                ).fetchall()
+                _c.close()
+                return _parse_rows(rows)
+        except Exception:
+            pass
+        # 2) Supabase フォールバック
+        try:
+            import sys as _sys2
+            _rag_dir2 = str(Path(__file__).parent / "studying")
+            if _rag_dir2 not in _sys2.path:
+                _sys2.path.insert(0, _rag_dir2)
+            from supabase_client import fetch_smart_questions as _sb_fetch
+            raw = _sb_fetch()
+            if raw:
+                return _parse_rows(
+                    (r["id"], r["course_id"], r["title"], r["text_content"])
+                    for r in raw
+                )
+        except Exception:
+            pass
+        return []
 
     _all_smart = _load_smart_questions()
     if not _all_smart:
