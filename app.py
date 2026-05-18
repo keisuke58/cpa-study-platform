@@ -5652,7 +5652,7 @@ elif page == "AI Q&A 🤖":
         st.markdown("---")
         st.subheader(t("ai_settings", _lang))
 
-        provider_labels = {"claude": "Claude (Anthropic)", "gemini": "Gemini (Google)", "openai": "OpenAI"}
+        provider_labels = {"claude": "Claude (Anthropic)", "gemini": "Gemini (Google)", "openai": "OpenAI", "local": "🏠 Local (fine-tuned)"}
         provider = st.selectbox(
             t("ai_provider", _lang),
             options=list(provider_labels.keys()),

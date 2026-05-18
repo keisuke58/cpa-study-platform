@@ -215,6 +215,8 @@ _SYSTEM_PROMPT = (
     "参考資料に答えがない場合は、その旨を伝えてください。"
 )
 
+LOCAL_MODEL_DIR = Path(__file__).parent / "models" / "cpa-qwen2.5-7b-lora"
+
 PROVIDERS = {
     "claude": {
         "models": ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"],
@@ -227,6 +229,10 @@ PROVIDERS = {
     "openai": {
         "models": ["gpt-4o-mini", "gpt-4o"],
         "env_key": "OPENAI_API_KEY",
+    },
+    "local": {
+        "models": [str(LOCAL_MODEL_DIR)],
+        "env_key": "",
     },
 }
 
@@ -271,10 +277,50 @@ def _generate_openai(query: str, context: str, model: str, api_key: str) -> str:
     return resp.choices[0].message.content
 
 
+def _generate_local(query: str, context: str, model: str, api_key: str) -> str:
+    """Fine-tuned LoRA モデルでローカル推論する（transformers + peft）"""
+    model_path = model if model != str(LOCAL_MODEL_DIR) else str(LOCAL_MODEL_DIR)
+    if not Path(model_path).exists():
+        return f"⚠️ ローカルモデルが見つかりません: {model_path}\n`finetune_lora.py` で学習後に使用してください。"
+
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    from peft import PeftModel
+
+    # モデルキャッシュ（Streamlit の再実行で再ロードしない）
+    cache_key = f"_local_model_{model_path}"
+    import functools
+    if not hasattr(_generate_local, "_cache"):
+        _generate_local._cache = {}
+    if cache_key not in _generate_local._cache:
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        base_model_name = "Qwen/Qwen2.5-7B-Instruct"
+        base = AutoModelForCausalLM.from_pretrained(
+            base_model_name,
+            torch_dtype=torch.float16,
+            device_map="auto",
+        )
+        model_obj = PeftModel.from_pretrained(base, model_path)
+        model_obj.eval()
+        _generate_local._cache[cache_key] = (tokenizer, model_obj)
+    tokenizer, model_obj = _generate_local._cache[cache_key]
+
+    messages = [
+        {"role": "system", "content": _SYSTEM_PROMPT},
+        {"role": "user", "content": f"【参考資料】\n{context}\n\n【質問】\n{query}"},
+    ]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt").to(model_obj.device)
+    with torch.no_grad():
+        out = model_obj.generate(**inputs, max_new_tokens=512, temperature=0.7, do_sample=True)
+    return tokenizer.decode(out[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+
+
 _GENERATORS = {
     "claude": _generate_claude,
     "gemini": _generate_gemini,
     "openai": _generate_openai,
+    "local":  _generate_local,
 }
 
 
@@ -296,9 +342,13 @@ def generate_answer(
         return f"⚠️ 未対応のプロバイダー: {provider}。{list(PROVIDERS.keys())} から選択してください。"
 
     pconf = PROVIDERS[provider]
-    key = api_key or os.environ.get(pconf["env_key"], "")
-    if not key:
-        return f"⚠️ {pconf['env_key']} が設定されていません。"
+    # ローカルモードは API キー不要
+    if provider == "local":
+        key = ""
+    else:
+        key = api_key or os.environ.get(pconf["env_key"], "")
+        if not key:
+            return f"⚠️ {pconf['env_key']} が設定されていません。"
 
     m = model or pconf["models"][0]
     context = _build_context(chunks)
