@@ -51,6 +51,9 @@ HEADERS = {
 # ──────────────────────────────────────────────────────────────────────────────
 
 def init_db(conn: sqlite3.Connection):
+    # WAL モード: 並列プロセスからの同時書き込みに対応
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS courses (
             id    INTEGER PRIMARY KEY,
@@ -326,6 +329,14 @@ def download_lesson_zip(sess: requests.Session, lesson_id: str,
             return 0
         data = r.json()
         if data.get("status") != "200" or not data.get("downLoadUrl"):
+            # 空レスポンスもマーク → 次回実行で再クエリしない
+            conn.execute(
+                "INSERT OR IGNORE INTO pdfs "
+                "(course_id, title, download_url, pdf_type, scraped_at) "
+                "VALUES (?,?,?,'_zip_marker',datetime('now'))",
+                (course_id, f"no_content_{lesson_id}", api_url),
+            )
+            conn.commit()
             return 0
 
         zip_url  = data["downLoadUrl"]
@@ -406,14 +417,20 @@ def download_lesson_zip(sess: requests.Session, lesson_id: str,
 # メイン
 # ──────────────────────────────────────────────────────────────────────────────
 
-async def run(email: str, password: str, max_courses: int = 0, max_zips: int = 0):
+async def run(email: str, password: str, max_courses: int = 0, max_zips: int = 0,
+             course_ids: list[int] | None = None):
     PDF_DIR.mkdir(exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     init_db(conn)
 
     sess, course_names = await login(email, password)
 
-    target_ids = CPA_COURSE_IDS[:max_courses] if max_courses > 0 else CPA_COURSE_IDS
+    if course_ids:
+        target_ids = course_ids
+    elif max_courses > 0:
+        target_ids = CPA_COURSE_IDS[:max_courses]
+    else:
+        target_ids = CPA_COURSE_IDS
 
     total_zips = 0
     total_pdfs = 0
@@ -442,11 +459,16 @@ async def run(email: str, password: str, max_courses: int = 0, max_zips: int = 0
         for sc_idx, subcat_id in enumerate(subcats, 1):
             print(f"\n  [{sc_idx}/{len(subcats)}] subcat={subcat_id}")
             lessons = get_lessons_in_subcat(sess, subcat_id)
-            practice_lessons = [l for l in lessons if l["type"] in ("practice", "question")]
-            print(f"    レッスン合計: {len(lessons)}  (practice/question: {len(practice_lessons)})")
 
-            for lsn in practice_lessons:
-                print(f"    → lesson_id={lsn['lesson_id']}  type={lsn['type']}")
+            # practice/question: waterMarkContentZip が確実に動く
+            # lesson: 基本講座にも付属テキスト PDF がある場合があるので同 API を試みる
+            all_downloadable = [l for l in lessons if l["type"] in ("practice", "question", "lesson")]
+            practice_count = sum(1 for l in lessons if l["type"] in ("practice", "question"))
+            print(f"    レッスン合計: {len(lessons)}  (practice/question: {practice_count})")
+
+            for lsn in all_downloadable:
+                ltype = lsn["type"]
+                print(f"    → lesson_id={lsn['lesson_id']}  type={ltype}")
 
                 n = download_lesson_zip(
                     sess, lsn["lesson_id"],
@@ -456,7 +478,8 @@ async def run(email: str, password: str, max_courses: int = 0, max_zips: int = 0
                 if n > 0:
                     total_zips += 1
 
-                time.sleep(0.5)  # サーバー負荷軽減
+                # lesson 型は API 空のことが多いので短めに待つ
+                time.sleep(0.2 if ltype == "lesson" else 0.5)
 
                 if max_zips > 0 and total_zips >= max_zips:
                     print(f"\n[info] --max-zips {max_zips} 到達。終了。")
@@ -506,10 +529,13 @@ if __name__ == "__main__":
     parser.add_argument("--password",    default=os.environ.get("STUDYIN_PASSWORD"))
     parser.add_argument("--max-courses", type=int, default=0, help="テスト: コース数上限")
     parser.add_argument("--max-zips",    type=int, default=0, help="テスト: ZIP数上限")
+    parser.add_argument("--course-ids",  type=int, nargs="+",
+                        help="処理するコースIDを指定 (例: --course-ids 2109 2110)")
     args = parser.parse_args()
 
     if not args.email or not args.password:
         print("[error] studying/.env に認証情報を設定してください。")
         sys.exit(1)
 
-    asyncio.run(run(args.email, args.password, args.max_courses, args.max_zips))
+    asyncio.run(run(args.email, args.password,
+                    args.max_courses, args.max_zips, args.course_ids))
