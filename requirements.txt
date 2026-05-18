@@ -11,3 +11,4 @@ google-generativeai
 openai
 chromadb
 supabase
+psycopg2-binary

@@ -1380,12 +1380,14 @@ if page == "Dashboard 📊":
             _smart_total = _sc.execute("SELECT COUNT(*) FROM pdfs WHERE pdf_type='スマート問題集'").fetchone()[0]
             _sc.close()
         else:
-            import sys as _sys_d
-            _rd = str(Path(__file__).parent / "studying")
-            if _rd not in _sys_d.path:
-                _sys_d.path.insert(0, _rd)
-            from supabase_client import fetch_pdf_count as _sbc
-            _smart_total = _sbc().get("スマート問題集", 0)
+            # JSON fallback
+            try:
+                import json as _json2
+                _jf2 = Path(__file__).parent / "studying" / "smart_questions.json"
+                if _jf2.exists():
+                    _smart_total = len(_json2.loads(_jf2.read_text()))
+            except Exception:
+                pass
     except Exception:
         pass
     _smart_wrong = len([w for w in st.session_state.data.get("wrong_answers", [])
@@ -5729,6 +5731,11 @@ elif page == "スマート問題集 📝":
 
     @st.cache_data(show_spinner=False, ttl=300)
     def _load_smart_questions():
+        import sys as _sys2
+        _rag_dir2 = str(Path(__file__).parent / "studying")
+        if _rag_dir2 not in _sys2.path:
+            _sys2.path.insert(0, _rag_dir2)
+
         # 1) ローカル SQLite
         try:
             import sqlite3 as _sq
@@ -5740,15 +5747,37 @@ elif page == "スマート問題集 📝":
                     "WHERE pdf_type='スマート問題集' ORDER BY course_id, id"
                 ).fetchall()
                 _c.close()
-                return _parse_rows(rows)
+                if rows:
+                    return _parse_rows(rows)
         except Exception:
             pass
-        # 2) Supabase フォールバック
+
+        # 2) JSON ファイル（git 管理、Cloud 対応）
         try:
-            import sys as _sys2
-            _rag_dir2 = str(Path(__file__).parent / "studying")
-            if _rag_dir2 not in _sys2.path:
-                _sys2.path.insert(0, _rag_dir2)
+            import json as _json
+            _jf = Path(__file__).parent / "studying" / "smart_questions.json"
+            if _jf.exists():
+                data = _json.loads(_jf.read_text())
+                return _parse_rows(
+                    (r["id"], r["course_id"], r["title"], r["text"]) for r in data
+                )
+        except Exception:
+            pass
+
+        # 3) Neon (DATABASE_URL)
+        try:
+            from neon_client import fetch_smart_questions as _neon_fetch
+            raw = _neon_fetch()
+            if raw:
+                return _parse_rows(
+                    (r["id"], r["course_id"], r["title"], r["text_content"])
+                    for r in raw
+                )
+        except Exception:
+            pass
+
+        # 4) Supabase (SUPABASE_URL)
+        try:
             from supabase_client import fetch_smart_questions as _sb_fetch
             raw = _sb_fetch()
             if raw:
@@ -5758,6 +5787,7 @@ elif page == "スマート問題集 📝":
                 )
         except Exception:
             pass
+
         return []
 
     _all_smart = _load_smart_questions()
