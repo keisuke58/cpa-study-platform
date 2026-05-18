@@ -1,3 +1,7 @@
 __pycache__/
 .streamlit/
 *.pyc
+studying/.env
+studying/auth_state.json
+studying/studyin.db
+studying/after_login.png
