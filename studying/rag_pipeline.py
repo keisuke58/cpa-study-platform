@@ -100,7 +100,17 @@ def build_index(force: bool = False):
         for c in new_chunks
     ]
 
-    collection.add(ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas)
+    # ChromaDB の最大バッチサイズに合わせて分割して追加
+    CHROMA_BATCH = 5000
+    for start in range(0, len(new_chunks), CHROMA_BATCH):
+        end = min(start + CHROMA_BATCH, len(new_chunks))
+        collection.add(
+            ids=ids[start:end],
+            embeddings=embeddings[start:end],
+            documents=texts[start:end],
+            metadatas=metadatas[start:end],
+        )
+        print(f"  追加: {end}/{len(new_chunks)}")
     print(f"インデックス構築完了: {CHROMA_DIR}")
 
 
