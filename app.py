@@ -3525,7 +3525,8 @@ elif page == "Analytics 📊":
                 def _extract_level(name):
                     m = _re2.search(r'Lv(\d)', str(name))
                     return int(m.group(1)) if m else 0
-                scores_df['level_n'] = scores_df['name'].apply(_extract_level)
+                _name_col = scores_df['name'] if 'name' in scores_df.columns else pd.Series([''] * len(scores_df), index=scores_df.index)
+                scores_df['level_n'] = _name_col.apply(_extract_level)
                 matrix_src = scores_df[scores_df['level_n'].isin([1, 2, 3])]
                 if not matrix_src.empty:
                     pivot = matrix_src.pivot_table(
@@ -5732,6 +5733,7 @@ elif page == "スマート問題集 📝":
         st.session_state.data["xp"] = st.session_state.data.get("xp", 0) + xp_gain
         # スコア記録
         st.session_state.data.setdefault("scores", []).append({
+            "name": "スマート問題集",
             "date": date.today().strftime("%Y-%m-%d"),
             "subject": "スマート問題集",
             "val": pct,
