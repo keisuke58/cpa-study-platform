@@ -1,19 +1,12 @@
-streamlit
+streamlit>=1.35
 pandas
+numpy
 plotly
 openpyxl
 pypdf
 janome
 edinet-tools
-torch
-# RAG / LLM
-chromadb
-sentence-transformers
 anthropic
 google-generativeai
 openai
-# Fine-tuning
-datasets
-peft
-trl
-bitsandbytes
+chromadb
