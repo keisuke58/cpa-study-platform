@@ -48,6 +48,13 @@ SUBJECT_MAP_EN = {
     "business-law": "USCPA_REG",
 }
 
+# course_id → subject (EN) — IRS/PCAOB/AICPA
+COURSE_ID_MAP_EN: dict[int, str] = {
+    9021: "USCPA_REG",  # IRS Publications (tax)
+    9022: "USCPA_AUD",  # PCAOB Auditing Standards
+    9023: "USCPA_FAR",  # AICPA Blueprints (FAR/AUD/REG/BAR mixed; FAR as default)
+}
+
 MCQ_SCHEMA = '{"q": "問題文", "options": ["A", "B", "C", "D"], "correct": 0, "explanation": "解説", "level": 2}'
 MCQ_SCHEMA_EN = '{"q": "Question text", "options": ["A", "B", "C", "D"], "correct": 0, "explanation": "Explanation", "level": 2}'
 
@@ -82,8 +89,8 @@ Return JSON array only:
 [{schema}, ...]"""
 
 
-def load_chunks(source_filter: str | None = None, limit: int = 0) -> list[dict]:
-    """chunks.jsonl からチャンクを読み込む。source でフィルター可能。"""
+def load_chunks(course_ids: list[int] | None = None, limit: int = 0) -> list[dict]:
+    """chunks.jsonl からチャンクを読み込む。course_ids でフィルター可能。"""
     if not CHUNKS_FILE.exists():
         return []
     chunks = []
@@ -91,8 +98,9 @@ def load_chunks(source_filter: str | None = None, limit: int = 0) -> list[dict]:
         if not line.strip():
             continue
         c = json.loads(line)
-        if source_filter and c.get("pdf_type", "") not in (source_filter,):
-            pass  # ソースフィルターは pdf_type or course_id で行う
+        if course_ids is not None:
+            if int(c.get("course_id", 0)) not in course_ids:
+                continue
         chunks.append(c)
     if limit:
         chunks = chunks[:limit]
@@ -121,10 +129,10 @@ def call_claude(prompt: str, api_key: str, model: str = "claude-sonnet-4-6") -> 
 
 
 def call_gemini(prompt: str, api_key: str, model: str = "gemini-2.0-flash") -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    m = genai.GenerativeModel(model_name=model)
-    return m.generate_content(prompt).text
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(model=model, contents=prompt)
+    return resp.text
 
 
 def call_openai(prompt: str, api_key: str, model: str = "gpt-4o-mini") -> str:
@@ -189,7 +197,14 @@ def generate(args):
     caller = _CALLERS[args.provider]
     model  = args.model or _DEFAULT_MODELS[args.provider]
 
-    chunks = load_chunks(limit=args.max_chunks)
+    course_ids = None
+    if args.course_ids:
+        course_ids = [int(x) for x in args.course_ids.split(",")]
+    elif args.lang == "en":
+        # デフォルトで英語ソース (IRS/PCAOB/AICPA) のみ対象
+        course_ids = list(COURSE_ID_MAP_EN.keys())
+
+    chunks = load_chunks(course_ids=course_ids, limit=args.max_chunks)
     if not chunks:
         raise SystemExit("⚠️ chunks.jsonl が空です。先に extract_qa_pairs.py を実行してください。")
 
@@ -237,12 +252,16 @@ def generate(args):
             continue
 
         # 科目割り当て
-        course_id  = chunk.get("course_id", 0)
+        course_id  = int(chunk.get("course_id", 0))
         if args.lang == "ja":
-            subject = SUBJECT_MAP_JA.get(int(course_id), "Financial")
+            subject = SUBJECT_MAP_JA.get(course_id, "Financial")
         else:
-            title = chunk.get("source_title", "")
-            subject = next((v for k, v in SUBJECT_MAP_EN.items() if k in title.lower()), "USCPA_FAR")
+            # course_id ベースの直接マッピング優先
+            if course_id in COURSE_ID_MAP_EN:
+                subject = COURSE_ID_MAP_EN[course_id]
+            else:
+                title = chunk.get("source_title", "")
+                subject = next((v for k, v in SUBJECT_MAP_EN.items() if k in title.lower()), "USCPA_FAR")
 
         valid_qs = [q for q in questions if validate_question(q)]
         if not valid_qs:
@@ -282,6 +301,7 @@ def main():
     parser.add_argument("--n", type=int, default=3, help="チャンクあたりの生成問題数")
     parser.add_argument("--max-chunks", type=int, default=50, help="処理するチャンク数の上限")
     parser.add_argument("--sleep", type=float, default=1.0, help="API 呼び出し間隔 (秒)")
+    parser.add_argument("--course-ids", default=None, help="対象 course_id をカンマ区切りで指定 (例: 9021,9022)")
     parser.add_argument("--force", action="store_true", help="処理済みチャンクも再処理")
     parser.add_argument("--dry-run", action="store_true", help="プロンプト確認のみ（API 呼び出しなし）")
     args = parser.parse_args()

@@ -325,10 +325,14 @@ def _generate_claude(query: str, context: str, model: str, api_key: str) -> str:
 
 
 def _generate_gemini(query: str, context: str, model: str, api_key: str) -> str:
-    import google.generativeai as genai
-    genai.configure(api_key=api_key)
-    m = genai.GenerativeModel(model_name=model, system_instruction=_SYSTEM_PROMPT)
-    resp = m.generate_content(f"【参考資料】\n{context}\n\n【質問】\n{query}")
+    from google import genai
+    from google.genai import types
+    client = genai.Client(api_key=api_key)
+    resp = client.models.generate_content(
+        model=model,
+        contents=f"【参考資料】\n{context}\n\n【質問】\n{query}",
+        config=types.GenerateContentConfig(system_instruction=_SYSTEM_PROMPT),
+    )
     return resp.text
 
 

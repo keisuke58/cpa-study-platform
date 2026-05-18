@@ -3465,13 +3465,35 @@ elif page == "Analytics 📊":
     logs_df   = pd.DataFrame(st.session_state.data.get("logs", []))
     wa_df     = pd.DataFrame(st.session_state.data.get("wrong_answers", []))
 
-    _SUBJ_ORDER  = ["Financial", "Management", "Audit", "Company"]
+    _is_uscpa_ana = st.session_state.get("is_uscpa", False)
+    _SUBJ_ORDER  = USCPA_SUBJECTS if _is_uscpa_ana else JPCPA_SUBJECTS
     _SUBJ_LABELS = {s: subject_label(s, _lang) for s in _SUBJ_ORDER}
 
     tab_radar, tab_heat, tab_ai = st.tabs(["🕸️ Skill Radar", "🗺️ Weakness Map", "🤖 AI Study Plan"])
 
     # ── Skill Radar ───────────────────────────────────────────────────────
     with tab_radar:
+        # Streak calculation
+        _study_dates = set()
+        if not logs_df.empty and 'date' in logs_df.columns:
+            _study_dates.update(logs_df['date'].tolist())
+        if not scores_df.empty and 'date' in scores_df.columns:
+            _study_dates.update(scores_df['date'].tolist())
+        _streak = 0
+        _check = date.today()
+        while _check.strftime('%Y-%m-%d') in _study_dates:
+            _streak += 1
+            _check = _check - pd.Timedelta(days=1)
+
+        sm1, sm2, sm3 = st.columns(3)
+        _today_str2 = date.today().strftime('%Y-%m-%d')
+        _today_q = 0 if scores_df.empty or 'date' not in scores_df.columns else int((scores_df['date'] == _today_str2).sum())
+        _overall_avg = 0 if scores_df.empty or 'val' not in scores_df.columns else round(float(scores_df['val'].mean()), 1)
+        sm1.metric("🔥 Study Streak", f"{_streak} days")
+        sm2.metric("📝 Today's Quizzes", f"{_today_q}")
+        sm3.metric("📊 Overall Avg", f"{_overall_avg}%")
+        st.divider()
+
         c1, c2 = st.columns(2)
         with c1:
             st.subheader("Skill Radar")
@@ -3498,19 +3520,42 @@ elif page == "Analytics 📊":
                 summary['Avg %'] = summary['Avg %'].round(1)
                 st.dataframe(summary, use_container_width=True, hide_index=True)
         with c2:
-            st.subheader("Study Time")
-            if not logs_df.empty:
-                logs_df['date_dt'] = pd.to_datetime(logs_df['date'])
-                daily = logs_df.groupby(logs_df['date_dt'].dt.date)['duration'].sum().reset_index()
-                daily.columns = ['Date', 'Minutes']
-                st.plotly_chart(px.bar(daily, x='Date', y='Minutes', title="Daily Study (min)", height=280),
-                                use_container_width=True)
-            else:
-                st.info("No study logs yet.")
+            st.subheader("Activity Calendar (90 days)")
+            # Build daily activity counts from logs + quiz scores
+            _act_counts: dict[str, int] = {}
+            if not logs_df.empty and 'date' in logs_df.columns:
+                for d in logs_df['date']:
+                    _act_counts[str(d)] = _act_counts.get(str(d), 0) + 1
+            if not scores_df.empty and 'date' in scores_df.columns:
+                for d in scores_df['date']:
+                    _act_counts[str(d)] = _act_counts.get(str(d), 0) + 1
+            # Build calendar grid for last 90 days
+            _days = pd.date_range(end=date.today(), periods=90, freq='D')
+            _cal_data = pd.DataFrame({
+                'date': _days,
+                'count': [_act_counts.get(d.strftime('%Y-%m-%d'), 0) for d in _days],
+                'week': [(d - _days[0]).days // 7 for d in _days],
+                'dow': [d.weekday() for d in _days],
+                'label': [d.strftime('%Y-%m-%d') for d in _days],
+            })
+            fig_cal = go.Figure(go.Heatmap(
+                x=_cal_data['week'], y=_cal_data['dow'],
+                z=_cal_data['count'], text=_cal_data['label'],
+                hovertemplate='%{text}: %{z} activities<extra></extra>',
+                colorscale=[[0,'#ebedf0'],[0.01,'#9be9a8'],[0.3,'#40c463'],[0.7,'#30a14e'],[1,'#216e39']],
+                showscale=False, xgap=2, ygap=2,
+            ))
+            fig_cal.update_layout(
+                yaxis=dict(tickvals=list(range(7)), ticktext=['Mon','Tue','Wed','Thu','Fri','Sat','Sun'], autorange='reversed'),
+                xaxis=dict(showticklabels=False),
+                height=200, margin=dict(l=40, r=10, t=10, b=10),
+            )
+            st.plotly_chart(fig_cal, use_container_width=True)
+
             if not scores_df.empty and 'date' in scores_df.columns:
                 scores_df['date_dt'] = pd.to_datetime(scores_df['date'])
                 fig_t = px.line(scores_df.sort_values('date_dt'), x='date_dt', y='val', color='subject',
-                                title="Score Trend", height=260,
+                                title="Score Trend", height=240,
                                 labels={'date_dt': 'Date', 'val': 'Score %', 'subject': 'Subject'})
                 st.plotly_chart(fig_t, use_container_width=True)
 
@@ -3531,9 +3576,10 @@ elif page == "Analytics 📊":
                 if not matrix_src.empty:
                     pivot = matrix_src.pivot_table(
                         index='level_n', columns='subject', values='val', aggfunc='mean'
-                    ).reindex(columns=_SUBJ_ORDER, fill_value=None)
-                    pivot.index = ['Level 1', 'Level 2', 'Level 3']
-                    pivot.columns = [_SUBJ_LABELS[s] for s in pivot.columns]
+                    ).reindex(columns=[s for s in _SUBJ_ORDER if s in matrix_src['subject'].unique()],
+                               fill_value=None)
+                    pivot.index = [f'Level {i}' for i in pivot.index]
+                    pivot.columns = [_SUBJ_LABELS.get(s, s) for s in pivot.columns]
                     fig_h = px.imshow(pivot, text_auto='.0f', color_continuous_scale='RdYlGn',
                                       zmin=0, zmax=100, aspect='auto',
                                       title="Accuracy % (Subject × Level)")
@@ -3562,6 +3608,19 @@ elif page == "Analytics 📊":
                 wa_topics['level'] = wa_topics['level'].apply(lambda x: f"Lv{int(x)}" if pd.notna(x) else "?")
                 st.dataframe(wa_topics.rename(columns={'count': 'Wrong Count'}),
                              use_container_width=True, hide_index=True)
+
+                # Recent trend: last 7 days vs all time
+                if 'date' in wa_df.columns:
+                    _7ago = (date.today() - pd.Timedelta(days=7)).strftime('%Y-%m-%d')
+                    _recent_wa = wa_df[wa_df['date'] >= _7ago]
+                    if not _recent_wa.empty:
+                        st.caption(f"⚡ Last 7 days: {len(_recent_wa)} wrong answers")
+                        _rwa_subj = _recent_wa.groupby('subject').size().reset_index(name='count')
+                        _rwa_subj['subject'] = _rwa_subj['subject'].map(lambda s: _SUBJ_LABELS.get(s, s))
+                        _rwa_subj = _rwa_subj.sort_values('count', ascending=False)
+                        for _, rr in _rwa_subj.iterrows():
+                            pct = int(rr['count'] / len(_recent_wa) * 100)
+                            st.progress(pct / 100, text=f"{rr['subject']}: {rr['count']} ({pct}%)")
 
     # ── AI Study Plan ─────────────────────────────────────────────────────
     with tab_ai:
