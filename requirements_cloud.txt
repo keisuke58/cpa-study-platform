@@ -1,0 +1,13 @@
+streamlit>=1.35
+pandas
+numpy
+plotly
+openpyxl
+pypdf
+janome
+edinet-tools
+anthropic
+google-generativeai
+openai
+chromadb
+sentence-transformers

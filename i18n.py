@@ -33,6 +33,7 @@ _T: dict[str, dict[str, str]] = {
     "nav_edinet":      {"ja": "EDINET 🧾",               "en": "EDINET 🧾"},
     "nav_future":      {"ja": "Future 🚀",               "en": "Future 🚀"},
     "nav_ai_qa":       {"ja": "AI Q&A 🤖",               "en": "AI Q&A 🤖"},
+    "nav_smart":       {"ja": "スマート問題集 📝",         "en": "Smart Drills 📝"},
 
     # ── Exam type selector ───────────────────────────────────────
     "exam_type_label": {"ja": "試験種別",                "en": "Exam Type"},
@@ -104,8 +105,9 @@ def nav_items(lang: str = "ja") -> list[str]:
         "nav_dashboard", "nav_syllabus", "nav_checklist", "nav_revisions",
         "nav_vocab", "nav_formulas", "nav_english", "nav_old_exams",
         "nav_timer", "nav_mock", "nav_scores", "nav_wrong", "nav_drills",
-        "nav_exam_mode", "nav_survival", "nav_analytics", "nav_roadmap",
-        "nav_big4", "nav_company", "nav_edinet", "nav_future", "nav_ai_qa",
+        "nav_smart", "nav_exam_mode", "nav_survival", "nav_analytics",
+        "nav_roadmap", "nav_big4", "nav_company", "nav_edinet", "nav_future",
+        "nav_ai_qa",
     ]
     return [t(k, lang) for k in keys]
 

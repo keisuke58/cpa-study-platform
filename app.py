@@ -1294,7 +1294,7 @@ with gl_c3:
         st.session_state['nav'] = "Drills 🔧"
         st.rerun()
 
-_nav_items = ["Dashboard 📊", "My Syllabus 📚", "Official Checklist ✅", "Revisions 🧭", "Vocabulary 📖", "Formulas 📐", "English Prep 🌐", "Old Exams 📄", "Study Timer ⏱️", "Mock Exams 📝", "Scores 📈", "Wrong Answers 📕", "Drills 🔧", "Exam Mode ⏲️", "Survival Mode ⚡", "Analytics 📊", "Roadmap 🗺️", "Big 4 Job Hunting 💼", "Company Directory 🏢", "Future 🚀"]
+_nav_items = ["Dashboard 📊", "My Syllabus 📚", "Official Checklist ✅", "Revisions 🧭", "Vocabulary 📖", "Formulas 📐", "English Prep 🌐", "Old Exams 📄", "Study Timer ⏱️", "Mock Exams 📝", "Scores 📈", "Wrong Answers 📕", "Drills 🔧", "スマート問題集 📝", "Exam Mode ⏲️", "Survival Mode ⚡", "Analytics 📊", "Roadmap 🗺️", "Big 4 Job Hunting 💼", "Company Directory 🏢", "Future 🚀", "AI Q&A 🤖"]
 _per_row = 3
 for _i in range(0, len(_nav_items), _per_row):
     _row = _nav_items[_i:_i+_per_row]
@@ -1370,16 +1370,33 @@ if page == "Dashboard 📊":
         except Exception:
             pass
 
-    m1, m2, m3, m4 = st.columns(4)
+    # スマート問題集の進捗を取得
+    _smart_total, _smart_done = 0, 0
+    try:
+        import sqlite3 as _sq
+        _sdb = Path(__file__).parent / "studying" / "studyin.db"
+        if _sdb.exists():
+            _sc = _sq.connect(str(_sdb))
+            _smart_total = _sc.execute("SELECT COUNT(*) FROM pdfs WHERE pdf_type='スマート問題集'").fetchone()[0]
+            _sc.close()
+    except Exception:
+        pass
+    _smart_wrong = len([w for w in st.session_state.data.get("wrong_answers", [])
+                        if w.get("source") == "smart"])
+    _smart_done = len([s for s in st.session_state.data.get("scores", [])
+                       if s.get("source") == "smart"])
+
+    m1, m2, m3, m4, m5 = st.columns(5)
     m1.metric("Study Time (Today)", f"{minutes_today} min", delta=f"{minutes_today/60:.1f} hrs")
     m2.metric("Quizzes Completed", f"{quizzes_today}", delta=f"Avg: {avg_score_today:.0f}%" if quizzes_today > 0 else None)
     m3.metric("Total XP", f"{total_xp}", delta="Level Up Soon?" if total_xp % 100 > 80 else None)
-    
-    # 4. Nearest Deadline
+    m4.metric("スマート問題集 解答済", f"{_smart_done}", delta=f"/ {_smart_total} 問" if _smart_total else None)
+
+    # 5. Nearest Deadline
     target_short = date(2026, 12, 13)
     days_short = (target_short - today).days
-    m4.metric("Next Exam (Dec Short)", f"{days_short} Days", delta="-1 Day", delta_color="inverse")
-    
+    m5.metric("Next Exam (Dec Short)", f"{days_short} Days", delta="-1 Day", delta_color="inverse")
+
     st.caption(f"🔥 Study Streak: {streak} days")
     
     st.markdown("---")
@@ -5615,6 +5632,170 @@ elif page == "EDINET 🧾":
                     pass
             except Exception as e:
                 st.error(f"エラー: {e}")
+
+elif page == "スマート問題集 📝":
+    st.header("スマート問題集 📝")
+    st.caption("studying.jp からスクレイピングした問題集。問題を解いて答えを確認しよう。")
+
+    # ── DB から問題読み込み ─────────────────────────────────────────
+    @st.cache_data(show_spinner=False, ttl=300)
+    def _load_smart_questions():
+        try:
+            import sqlite3 as _sq
+            _sdb = Path(__file__).parent / "studying" / "studyin.db"
+            if not _sdb.exists():
+                return []
+            _c = _sq.connect(str(_sdb))
+            rows = _c.execute(
+                "SELECT id, course_id, title, text_content FROM pdfs "
+                "WHERE pdf_type='スマート問題集' ORDER BY course_id, id"
+            ).fetchall()
+            _c.close()
+            result = []
+            _COURSE_SUBJECT = {
+                2098: "管理会計論", 2099: "監査論", 2106: "企業法",
+                2107: "財務会計論", 2109: "財務会計論", 2110: "管理会計論", 2252: "財務会計論",
+            }
+            for pid, cid, title, text in rows:
+                parts = (text or "").split("--- 解答 ---")
+                q_block = parts[0].strip()
+                a_block = parts[1].strip() if len(parts) > 1 else ""
+                # q_block: "タイトル\n\n問題文"
+                q_lines = q_block.split("\n\n", 1)
+                q_text = q_lines[1].strip() if len(q_lines) > 1 else q_block
+                result.append({
+                    "id": pid, "course_id": cid,
+                    "subject": _COURSE_SUBJECT.get(cid, "その他"),
+                    "title": title,
+                    "question": q_text,
+                    "answer": a_block,
+                })
+            return result
+        except Exception as e:
+            st.error(f"DB読み込みエラー: {e}")
+            return []
+
+    _all_smart = _load_smart_questions()
+    if not _all_smart:
+        st.warning("スマート問題集データがありません。scraper.py を実行してください。")
+        st.stop()
+
+    # ── サイドバー設定 ────────────────────────────────────────────
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("📝 スマート問題集")
+        _subjects_available = sorted(set(q["subject"] for q in _all_smart))
+        _sel_subjects = st.multiselect(
+            "科目フィルタ", _subjects_available,
+            default=_subjects_available, key="smart_subj_filter"
+        )
+        _smart_n = st.slider("出題数", 5, 30, 10, key="smart_n")
+        _smart_kw = st.text_input("キーワード検索", "", key="smart_kw")
+        if st.button("🔀 問題を新しくひく", key="smart_reshuffle"):
+            for k in ["smart_qs", "smart_idx", "smart_results"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    # ── フィルタリング ────────────────────────────────────────────
+    _filtered = [q for q in _all_smart if q["subject"] in _sel_subjects]
+    if _smart_kw:
+        kw = _smart_kw.lower()
+        _filtered = [q for q in _filtered
+                     if kw in q["question"].lower() or kw in q["title"].lower()]
+
+    st.info(f"フィルタ後: **{len(_filtered)} 問** (全 {len(_all_smart)} 問中)　科目: {', '.join(_sel_subjects) or 'なし'}")
+
+    if not _filtered:
+        st.warning("条件に合う問題がありません。フィルタを変更してください。")
+        st.stop()
+
+    # ── 問題セット初期化 ─────────────────────────────────────────
+    if "smart_qs" not in st.session_state:
+        import random as _rnd
+        st.session_state["smart_qs"] = _rnd.sample(_filtered, min(_smart_n, len(_filtered)))
+        st.session_state["smart_idx"] = 0
+        st.session_state["smart_results"] = []  # list of {"correct": bool}
+
+    _qs = st.session_state["smart_qs"]
+    _idx = st.session_state["smart_idx"]
+    _results = st.session_state["smart_results"]
+
+    # ── 完了画面 ─────────────────────────────────────────────────
+    if _idx >= len(_qs):
+        n_correct = sum(1 for r in _results if r.get("correct"))
+        n_total = len(_results)
+        pct = n_correct / n_total * 100 if n_total else 0
+        st.balloons()
+        st.success(f"## 完了！ {n_correct} / {n_total} 正解 ({pct:.0f}%)")
+        # XP 付与
+        xp_gain = n_correct * 5
+        st.session_state.data["xp"] = st.session_state.data.get("xp", 0) + xp_gain
+        # スコア記録
+        st.session_state.data.setdefault("scores", []).append({
+            "date": date.today().strftime("%Y-%m-%d"),
+            "subject": "スマート問題集",
+            "val": pct,
+            "source": "smart",
+        })
+        save_data(st.session_state.data)
+        st.info(f"🎉 XP +{xp_gain} 獲得！")
+        if st.button("もう一度", key="smart_retry"):
+            for k in ["smart_qs", "smart_idx", "smart_results"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+        st.stop()
+
+    # ── 進捗バー ─────────────────────────────────────────────────
+    st.progress((_idx) / len(_qs), text=f"問題 {_idx + 1} / {len(_qs)}")
+
+    # ── 現在の問題 ───────────────────────────────────────────────
+    _q = _qs[_idx]
+    st.markdown(f"### {_q['title']}")
+    st.markdown(f"**科目**: {_q['subject']}")
+    st.markdown("---")
+    st.markdown(_q["question"])
+
+    # ── 答え表示トグル ────────────────────────────────────────────
+    _ans_key = f"smart_show_ans_{_idx}"
+    if _ans_key not in st.session_state:
+        st.session_state[_ans_key] = False
+
+    col_show, col_ok, col_ng = st.columns([2, 1, 1])
+    with col_show:
+        if st.button("💡 解答を見る", key=f"smart_reveal_{_idx}"):
+            st.session_state[_ans_key] = True
+
+    if st.session_state[_ans_key]:
+        with st.expander("📖 解答・解説", expanded=True):
+            st.markdown(_q["answer"])
+
+        with col_ok:
+            if st.button("✅ 正解", key=f"smart_ok_{_idx}", type="primary"):
+                _results.append({"correct": True, "id": _q["id"]})
+                st.session_state["smart_idx"] += 1
+                st.session_state[_ans_key] = False
+                st.rerun()
+        with col_ng:
+            if st.button("❌ 不正解", key=f"smart_ng_{_idx}"):
+                _results.append({"correct": False, "id": _q["id"]})
+                # 不正解は wrong_answers に記録
+                st.session_state.data.setdefault("wrong_answers", []).append({
+                    "date": date.today().strftime("%Y-%m-%d"),
+                    "subject": _q["subject"],
+                    "q": _q["title"],
+                    "source": "smart",
+                })
+                save_data(st.session_state.data)
+                st.session_state["smart_idx"] += 1
+                st.session_state[_ans_key] = False
+                st.rerun()
+
+    # ── 過去の正誤サマリー（折りたたみ）────────────────────────────
+    if _results:
+        with st.expander(f"📊 これまでの結果 ({sum(1 for r in _results if r['correct'])}/{len(_results)} 正解)"):
+            for i, r in enumerate(_results):
+                icon = "✅" if r["correct"] else "❌"
+                st.markdown(f"{icon} 問題 {i+1}: {_qs[i]['title']}")
 
 elif page == "AI Q&A 🤖":
     st.header(t("ai_title", _lang))
