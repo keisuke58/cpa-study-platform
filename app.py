@@ -1292,7 +1292,7 @@ with st.sidebar.expander("📅 Official Schedule (Edit)"):
         save_data(st.session_state.data)
         st.toast("Official schedule saved", icon="✅")
         official_schedule = edit_rows
-page = st.sidebar.radio("Navigation", ["Dashboard 📊", "My Syllabus 📚", "Official Checklist ✅", "Revisions 🧭", "Vocabulary 📖", "Formulas 📐", "English Prep 🌐", "Old Exams 📄", "Study Timer ⏱️", "Mock Exams 📝", "Scores 📈", "Wrong Answers 📕", "Drills 🔧", "Exam Mode ⏲️", "Survival Mode ⚡", "Analytics 📊", "Roadmap 🗺️", "Big 4 Job Hunting 💼", "Company Directory 🏢", "EDINET 🧾", "Future 🚀"], key="nav")
+page = st.sidebar.radio("Navigation", ["Dashboard 📊", "My Syllabus 📚", "Official Checklist ✅", "Revisions 🧭", "Vocabulary 📖", "Formulas 📐", "English Prep 🌐", "Old Exams 📄", "Study Timer ⏱️", "Mock Exams 📝", "Scores 📈", "Wrong Answers 📕", "Drills 🔧", "Exam Mode ⏲️", "Survival Mode ⚡", "Analytics 📊", "Roadmap 🗺️", "Big 4 Job Hunting 💼", "Company Directory 🏢", "EDINET 🧾", "Future 🚀", "AI Q&A 🤖"], key="nav")
 
 if page == "Dashboard 📊":
     st.header("Dashboard 🚀")
@@ -5457,4 +5457,139 @@ elif page == "EDINET 🧾":
                     pass
             except Exception as e:
                 st.error(f"エラー: {e}")
+
+elif page == "AI Q&A 🤖":
+    st.header("CPA AI アシスタント 🤖")
+    st.caption("studying.jp の講座資料を基に、CPA 試験の質問に答えます。")
+
+    import sys as _sys
+    _rag_dir = str(Path(__file__).parent / "studying")
+    if _rag_dir not in _sys.path:
+        _sys.path.insert(0, _rag_dir)
+
+    # --- サイドバー設定 ---
+    with st.sidebar:
+        st.markdown("---")
+        st.subheader("📥 スクレイプ進捗")
+        try:
+            import sqlite3 as _sqlite3
+            _db_path = Path(__file__).parent / "studying" / "studyin.db"
+            _conn = _sqlite3.connect(str(_db_path))
+            _rows = _conn.execute(
+                "SELECT pdf_type, COUNT(*) FROM pdfs GROUP BY pdf_type"
+            ).fetchall()
+            _total = _conn.execute("SELECT COUNT(*) FROM pdfs").fetchone()[0]
+            _courses = _conn.execute("SELECT COUNT(DISTINCT course_id) FROM pdfs").fetchone()[0]
+            _conn.close()
+            _type_map = dict(_rows)
+            st.metric("取得済み PDF", f"{_total} 件")
+            col_a, col_b = st.columns(2)
+            col_a.metric("設問", _type_map.get("設問", 0))
+            col_b.metric("解答", _type_map.get("解答", 0))
+            st.caption(f"対象コース: {_courses} / 7")
+        except Exception as _e:
+            st.caption(f"DB 読み込み失敗: {_e}")
+
+        st.markdown("---")
+        st.subheader("AI 設定")
+
+        provider_labels = {"claude": "Claude (Anthropic)", "gemini": "Gemini (Google)", "openai": "OpenAI"}
+        provider = st.selectbox(
+            "LLM プロバイダー",
+            options=list(provider_labels.keys()),
+            format_func=lambda x: provider_labels[x],
+            key="ai_provider",
+        )
+
+        try:
+            from rag_pipeline import PROVIDERS
+            model_options = PROVIDERS[provider]["models"]
+        except Exception:
+            model_options = []
+        model = st.selectbox("モデル", model_options, key="ai_model") if model_options else None
+
+        env_key_map = {"claude": "ANTHROPIC_API_KEY", "gemini": "GOOGLE_API_KEY", "openai": "OPENAI_API_KEY"}
+        api_key_input = st.text_input(
+            env_key_map.get(provider, "API KEY"),
+            value=os.environ.get(env_key_map.get(provider, ""), ""),
+            type="password",
+            key="ai_api_key",
+        )
+
+        top_k = st.slider("取得チャンク数", 1, 10, 5, key="ai_top_k")
+        show_sources = st.checkbox("参照資料を表示", value=True, key="ai_show_src")
+
+    # --- インデックス構築ボタン ---
+    col_build, col_info = st.columns([1, 3])
+    with col_build:
+        if st.button("📦 インデックス構築", help="新規 PDF が追加されたときに押してください"):
+            try:
+                import subprocess
+                result = subprocess.run(
+                    [_sys.executable, "extract_qa_pairs.py"],
+                    cwd=_rag_dir,
+                    capture_output=True,
+                    text=True,
+                )
+                st.code(result.stdout + result.stderr)
+                from rag_pipeline import build_index
+                build_index()
+                st.success("インデックス構築完了！")
+            except Exception as e:
+                st.error(f"構築エラー: {e}")
+    with col_info:
+        try:
+            from rag_pipeline import CHROMA_DIR, CHUNKS_FILE
+            n_chunks = len(CHUNKS_FILE.read_text().splitlines()) if CHUNKS_FILE.exists() else 0
+            st.info(f"チャンク数: {n_chunks} | DB: {CHROMA_DIR}")
+        except Exception:
+            st.info("インデックス未構築")
+
+    # --- 会話履歴 ---
+    if "ai_messages" not in st.session_state:
+        st.session_state["ai_messages"] = []
+
+    for msg in st.session_state["ai_messages"]:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("sources") and show_sources:
+                with st.expander("参照資料"):
+                    for s in msg["sources"]:
+                        st.markdown(f"- **{s['title']}** (score={s['score']:.3f})")
+
+    # --- 入力 ---
+    if query := st.chat_input("CPA 試験について質問してください…"):
+        st.session_state["ai_messages"].append({"role": "user", "content": query})
+        with st.chat_message("user"):
+            st.markdown(query)
+
+        with st.chat_message("assistant"):
+            with st.spinner("検索・回答生成中…"):
+                try:
+                    from rag_pipeline import retrieve, generate_answer
+                    chunks = retrieve(query, k=top_k)
+                    answer = generate_answer(
+                        query,
+                        chunks,
+                        provider=provider,
+                        model=model or None,
+                        api_key=api_key_input or None,
+                    )
+                    sources = [{"title": c.source_title, "score": c.score} for c in chunks]
+                except Exception as e:
+                    answer = f"⚠️ エラーが発生しました: {e}"
+                    sources = []
+
+            st.markdown(answer)
+            if sources and show_sources:
+                with st.expander("参照資料"):
+                    for s in sources:
+                        st.markdown(f"- **{s['title']}** (score={s['score']:.3f})")
+
+        st.session_state["ai_messages"].append({"role": "assistant", "content": answer, "sources": sources})
+
+    if st.session_state["ai_messages"]:
+        if st.button("🗑️ 会話をリセット", key="ai_clear"):
+            st.session_state["ai_messages"] = []
+            st.rerun()
 

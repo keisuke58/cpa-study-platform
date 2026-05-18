@@ -1,0 +1,10 @@
+chroma_db/
+models/
+PDF/
+*.jsonl
+*.db
+*.log
+*.png
+*.env
+after_login.png
+course_list.png
